@@ -4,8 +4,9 @@ import torch.nn.functional as F
 import numpy as np
 import math
 from einops import rearrange
+from typing import Any
 
-from simpledesign.models.utils import apply_rope, rope_cos_sin
+from simpledesign.models.utils import apply_rope, rope_cos_sin, sinusoidal
 
 
 # build the Mixture-of-Transformer (MoT) Trunk
@@ -19,6 +20,136 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor):
         return self.out(self.act(self.in_(self.norm(x))))
+
+
+class TimeEmbedding(nn.Module):
+    def __init__(self, model_d: int, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.model_d = model_d
+
+        self.layers = nn.Sequential(
+            *[
+                nn.Linear(256, self.model_d),
+                nn.SiLU(),
+                nn.Linear(self.model_d, self.model_d),
+            ]
+        )
+
+        # zero-init last layer: output is exactly 0 at init (keeps ESM2 equivalence), while the
+        # last layer still gets gradients from step 1 because its input is nonzero
+        nn.init.zeros_(self.layers[-1].weight)
+        nn.init.zeros_(self.layers[-1].bias)
+
+    def forward(self, t: torch.Tensor):
+        """t: (B,) noise level in [0, 1] -> (B, model_d)."""
+        assert t.dim() == 1, f"t must be (B,), got {tuple(t.shape)}"
+        f = sinusoidal(t * 1000, 256)  # (B,)-> (B, 256)
+        return self.layers(f.to(self.layers[0].weight.dtype))
+
+
+class SequenceEmbedding(nn.Module):
+    # ESM2 alphabet: 33 tokens, <pad> = 1, <mask> = 32
+    ESM2_KEY = "esm.embeddings.word_embeddings.weight"
+    MASK_ID = 32
+    # ESM2 pretraining masked 15% of tokens, 80% of those with <mask>
+    ESM2_MASK_RATIO_TRAIN = 0.15 * 0.8
+
+    def __init__(
+        self,
+        model_d: int,
+    ):
+        super().__init__()
+        self.embed = nn.Embedding(33, model_d, padding_idx=1)
+
+    @torch.no_grad()
+    def load_esm2(self, esm_state_dict: dict[str, torch.Tensor]) -> None:
+        """Copy ESM2's token embedding from a checkpoint state dict
+        (e.g. safetensors.torch.load_file("checkpoints/<esm2>/model.safetensors"))."""
+        weight = esm_state_dict[self.ESM2_KEY]
+        assert weight.shape == self.embed.weight.shape, (
+            f"ESM2 embedding {tuple(weight.shape)} != {tuple(self.embed.weight.shape)}: "
+            "model_d must match the checkpoint's hidden_size"
+        )
+        self.embed.weight.copy_(weight)
+
+    def forward(self, x: torch.Tensor, seq_mask: torch.Tensor):
+        """x: (B, L) token ids, seq_mask: (B, L) bool, True for real tokens (incl. <cls>/<eos>).
+
+        ESM2 token_dropout, exactly as in pretraining (and DPLM): <mask> embeddings are zeroed
+        and all embeddings are rescaled by (1 - 0.12) / (1 - r), r = fraction of real tokens
+        that are <mask>. Padding is zeroed.
+        """
+        emb = self.embed(x)
+        is_mask = x == self.MASK_ID
+        emb = emb.masked_fill(is_mask[..., None], 0.0)
+        ratio = is_mask.sum(-1).float() / seq_mask.sum(-1).float()  # (B,)
+        scale = (1 - self.ESM2_MASK_RATIO_TRAIN) / (1 - ratio)
+        return emb * scale[:, None, None].to(emb.dtype) * seq_mask[..., None].to(emb.dtype)
+
+
+class StructureEmbedding(nn.Module):
+    """z_x = LayerNorm(Linear(gamma(x))) with Gaussian random Fourier features
+    gamma(x) = [cos(2*pi x B^T), sin(2*pi x B^T)], B ~ N(0, sigma^2) of shape (n_fourier, 3).
+
+    sigma is in cycles per coordinate unit, so it depends on how coordinates are scaled.
+    Feature wavelengths 1/|B_i| fall in a narrow band around ~0.65/sigma (5-95%: ~0.36/sigma to
+    ~1.7/sigma), e.g. sigma=0.1 with coordinates in A -> ~3.6-17 A.
+    """
+
+    def __init__(self, model_d: int, *, sigma: float, n_fourier: int = 128, seed: int = 0):
+        super().__init__()
+        # Own generator: deterministic B without consuming the global RNG. B is a persistent
+        # buffer, so checkpoints restore it exactly regardless of seed.
+        gen = torch.Generator().manual_seed(seed)
+        self.register_buffer("B", torch.randn(n_fourier, 3, generator=gen) * sigma)
+        self.proj = nn.Linear(2 * n_fourier, model_d)
+        self.norm = nn.LayerNorm(model_d)
+
+    def forward(self, x: torch.Tensor):
+        """x: (..., 3) coordinates -> (..., model_d)."""
+        angles = 2 * math.pi * x.float() @ self.B.float().T  # (..., n_fourier)
+        feats = torch.cat((angles.cos(), angles.sin()), dim=-1).to(self.proj.weight.dtype)
+        return self.norm(self.proj(feats))
+
+
+class InputEmbeddings(nn.Module):
+    def __init__(self, model_d: int, esm_state_dict, sigma):
+        super().__init__()
+        self.model_d = model_d
+        # initialize each module
+        self.seq_emb = SequenceEmbedding(model_d)
+        self.seq_emb.load_esm2(esm_state_dict=esm_state_dict)
+        self.struct_emb = StructureEmbedding(model_d, sigma=sigma)
+        # ESM2 never saw an absolute PE: zero-init gate keeps the sequence stream == ESM2 at init
+        self.seq_pe_gate = nn.Parameter(torch.zeros(()))
+        # noise-level conditioning, one per modality (zero-init output)
+        self.time_seq = TimeEmbedding(model_d)
+        self.time_struct = TimeEmbedding(model_d)
+
+    def forward(
+        self,
+        seq,
+        struct,
+        seq_mask,
+        idx,
+        t,
+        t_prime,
+    ):
+        """seq: (B, L) token ids, struct: (B, L, 3) coords, seq_mask: (B, L) bool real tokens,
+        idx: (B, L) residue index (the same tensor passed to StackMoT for RoPE),
+        t / t_prime: (B,) sequence / structure noise levels -> x_seq, x_struct: (B, L, model_d).
+        """
+        # embed sequence and structure:
+        seq_embedded = self.seq_emb(seq, seq_mask)
+        struct_embedded = self.struct_emb(struct)
+        # now apply abs PE: one encoding of idx, shared by both streams
+        pe = sinusoidal(idx, self.model_d).to(seq_embedded.dtype)  # (B, L, model_d)
+        seq_embedded = seq_embedded + self.seq_pe_gate * pe
+        struct_embedded = struct_embedded + pe
+        # time embeddings: (B, D) broadcast over every position of the stream
+        seq_embedded = seq_embedded + self.time_seq(t)[:, None, :]
+        struct_embedded = struct_embedded + self.time_struct(t_prime)[:, None, :]
+        return seq_embedded, struct_embedded
 
 
 class MoT(nn.Module):

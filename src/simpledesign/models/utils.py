@@ -1,6 +1,27 @@
+import math
+
 import torch
 import torch.nn as nn
 import numpy as np
+
+
+def sinusoidal(x: torch.Tensor, dim: int, max_period: float = 10_000.0) -> torch.Tensor:
+    """Sinusoidal features of a scalar per element: x (...) -> (..., dim), computed in float32.
+
+    Frequencies are geometric from 1 down to 1/max_period; the first half of the output is
+    cos, the second half sin (odd dim: last channel is zero). Used for the absolute positional
+    encoding of residue indices and for time features (scale t in [0, 1] up first, e.g. by
+    1000, otherwise most frequencies barely change across t).
+    """
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(half, device=x.device, dtype=torch.float32) / half
+    )
+    args = x.float()[..., None] * freqs  # (..., half)
+    emb = torch.cat((args.cos(), args.sin()), dim=-1)
+    if dim % 2:
+        emb = torch.cat((emb, torch.zeros_like(emb[..., :1])), dim=-1)
+    return emb
 
 
 def rope_cos_sin(
