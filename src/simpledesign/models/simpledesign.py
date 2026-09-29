@@ -1,10 +1,16 @@
+import json
+import math
+import numbers
+import re
+from pathlib import Path
+from typing import Any, List, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import math
+import torch.nn.init as init
 from einops import rearrange
-from typing import Any
+from safetensors.torch import load_file
 
 from simpledesign.models.utils import apply_rope, rope_cos_sin, sinusoidal
 
@@ -23,7 +29,7 @@ class MLP(nn.Module):
 
 
 class TimeEmbedding(nn.Module):
-    def __init__(self, model_d: int, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, model_d: int, *args: Any, zero_init: bool = True, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.model_d = model_d
 
@@ -36,9 +42,12 @@ class TimeEmbedding(nn.Module):
         )
 
         # zero-init last layer: output is exactly 0 at init (keeps ESM2 equivalence), while the
-        # last layer still gets gradients from step 1 because its input is nonzero
-        nn.init.zeros_(self.layers[-1].weight)
-        nn.init.zeros_(self.layers[-1].bias)
+        # last layer still gets gradients from step 1 because its input is nonzero.
+        # zero_init=False when the output feeds a zero-init layer itself (e.g. AdaLN modulation),
+        # otherwise both start at zero and neither gets a gradient through that path at step 0.
+        if zero_init:
+            nn.init.zeros_(self.layers[-1].weight)
+            nn.init.zeros_(self.layers[-1].bias)
 
     def forward(self, t: torch.Tensor):
         """t: (B,) noise level in [0, 1] -> (B, model_d)."""
@@ -113,18 +122,21 @@ class StructureEmbedding(nn.Module):
 
 
 class InputEmbeddings(nn.Module):
-    def __init__(self, model_d: int, esm_state_dict, sigma):
+    def __init__(self, model_d: int, sigma: float):
         super().__init__()
         self.model_d = model_d
         # initialize each module
         self.seq_emb = SequenceEmbedding(model_d)
-        self.seq_emb.load_esm2(esm_state_dict=esm_state_dict)
         self.struct_emb = StructureEmbedding(model_d, sigma=sigma)
         # ESM2 never saw an absolute PE: zero-init gate keeps the sequence stream == ESM2 at init
         self.seq_pe_gate = nn.Parameter(torch.zeros(()))
         # noise-level conditioning, one per modality (zero-init output)
         self.time_seq = TimeEmbedding(model_d)
         self.time_struct = TimeEmbedding(model_d)
+
+    def load_esm2(self, esm_state_dict: dict[str, torch.Tensor]) -> None:
+        """Only the token embedding is pretrained; structure, PE gate and time stay as init."""
+        self.seq_emb.load_esm2(esm_state_dict)
 
     def forward(
         self,
@@ -237,6 +249,142 @@ class MoT(nn.Module):
         return x_seq, x_struct
 
 
+class SequenceOutputHead(nn.Module):
+    """ESM2 LM-head layout: dense -> GELU -> LayerNorm -> decoder + bias -> (B, L, 33) logits.
+
+    The decoder weight is *tied* to the input token embedding: `self.decoder.weight` is the very
+    same nn.Parameter object as `SequenceEmbedding.embed.weight` (shape (33, model_d)), so there
+    is one tensor, updated by gradients from both uses. The bias stays a separate parameter, as
+    in ESM2. Logits cover all 33 ESM2 tokens; the 20 amino acids are ids 4-23, so mask the rest
+    in the loss/sampler. Softmax is left to the loss (F.cross_entropy).
+    """
+
+    ESM2_PREFIX = "lm_head."
+
+    def __init__(self, model_d: int, tied_weight: nn.Parameter):
+        super().__init__()
+        vocab_size, d = tied_weight.shape
+        assert d == model_d, f"tied weight has width {d}, head has model_d={model_d}"
+        self.dense = nn.Linear(model_d, model_d)
+        self.act = nn.GELU()
+        self.norm = nn.LayerNorm(model_d)
+        self.decoder = nn.Linear(model_d, vocab_size, bias=False)
+        self.decoder.weight = tied_weight  # tie: share the Parameter, don't copy it
+        self.bias = nn.Parameter(torch.zeros(vocab_size))
+
+    @torch.no_grad()
+    def load_esm2(self, esm_state_dict: dict[str, torch.Tensor]) -> None:
+        """Copy ESM2's LM head (dense, layer_norm, bias). decoder.weight is not in the
+        checkpoint: ESM2 ties it to the token embedding, as here."""
+        p = self.ESM2_PREFIX
+        self.dense.weight.copy_(esm_state_dict[p + "dense.weight"])
+        self.dense.bias.copy_(esm_state_dict[p + "dense.bias"])
+        self.norm.weight.copy_(esm_state_dict[p + "layer_norm.weight"])
+        self.norm.bias.copy_(esm_state_dict[p + "layer_norm.bias"])
+        self.bias.copy_(esm_state_dict[p + "bias"])
+
+    def forward(self, x_seq: torch.Tensor):
+        return self.decoder(self.norm(self.act(self.dense(x_seq)))) + self.bias
+
+
+class AdaLN(nn.Module):
+    """Adaptive LayerNorm (DiT): LayerNorm without learned affine, whose scale and shift are
+    predicted per sample from a conditioning vector c (e.g. an embedding of t'):
+        shift, scale = Linear(SiLU(c)).chunk(2)
+        out = LN(x) * (1 + scale) + shift
+    The modulation Linear is zero-initialized, so at init this is a plain LN (no affine).
+    """
+
+    def __init__(self, model_d: int, cond_d: int, eps: float = 1e-5):
+        super().__init__()
+        self.norm = nn.LayerNorm(model_d, elementwise_affine=False, eps=eps)
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(cond_d, 2 * model_d))
+        nn.init.zeros_(self.modulation[-1].weight)
+        nn.init.zeros_(self.modulation[-1].bias)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """x: (B, L, model_d), c: (B, cond_d) -> (B, L, model_d)."""
+        shift, scale = self.modulation(c).chunk(2, dim=-1)  # (B, model_d) each
+        return self.norm(x) * (1 + scale[:, None, :]) + shift[:, None, :]
+
+
+class AdaNorm(nn.Module):
+    def __init__(
+        self,
+        normalized_shape: Union[int, List[int,]],
+        t: float = 0.1,
+        eps: float = 1e-5,
+        bias: bool = False,
+    ) -> None:
+        super(AdaNorm, self).__init__()
+
+        # this handle if the shape is a single dim
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(normalized_shape)
+        self.t = t
+        self.eps = eps
+        self.weight = nn.Parameter(torch.empty(self.normalized_shape))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.normalized_shape))
+        else:
+            self.register_parameter("bias", None)
+
+        self.reset_parameters()
+
+    def reset_parameters(
+        self,
+    ) -> None:
+        init.ones_(self.weight)
+        if self.bias is not None:
+            init.zeros_(self.bias)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        mean = torch.mean(input, dim=-1, keepdim=True)
+        var = (input - mean).pow(2).mean(dim=-1, keepdim=True) + self.eps
+
+        input_norm = (input - mean) * torch.rsqrt(var)
+        adanorm = self.weight * (1 - self.t * input_norm) * input_norm
+
+        if self.bias is not None:
+            adanorm = adanorm + self.bias
+        return adanorm
+
+
+class StructureOutputHead(nn.Module):
+    """Predicts the structure velocity field per position: (B, L, model_in) -> (B, L, 3).
+
+    norm="adaln": LN modulated by t' (per sample) via AdaLN, conditioned on the head's own time
+    embedding of t'. norm="adanorm": your AdaNorm (constant k, ignores t'), for comparison.
+    The output layer is zero-initialized: predicted velocity is 0 at init.
+    """
+
+    def __init__(self, model_in: int, model_d: int, norm: str = "adaln"):
+        super().__init__()
+        assert norm in ("adaln", "adanorm"), f"unknown norm {norm!r}"
+        self.norm_type = norm
+        self.input = nn.Linear(model_in, model_d)
+        self.act = nn.ReLU()
+        if norm == "adaln":
+            # normal init (not zero): AdaLN's modulation is already zero-init
+            self.time = TimeEmbedding(model_d, zero_init=False)
+            self.norm = AdaLN(model_d, cond_d=model_d)
+        else:
+            self.norm = AdaNorm(model_d)
+        self.output = nn.Linear(model_d, 3)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, x_struct: torch.Tensor, t_prime: torch.Tensor):
+        """x_struct: (B, L, model_in), t_prime: (B,) -> velocity (B, L, 3)."""
+        h = self.input(x_struct)
+        if self.norm_type == "adaln":
+            h = self.norm(h, self.time(t_prime))
+        else:
+            h = self.norm(h)
+        return self.output(self.act(h))
+
+
 class StackMoT(nn.Module):
     def __init__(self, n_blocks, model_d, mlp_d, num_heads, rope_base: float = 10_000.0):
         super().__init__()
@@ -247,6 +395,39 @@ class StackMoT(nn.Module):
         inv_freq = rope_base ** (-torch.arange(0, self.d_k, 2, dtype=torch.float32) / self.d_k)
         self.register_buffer("inv_freq", inv_freq)
 
+    # ESM2 layer submodule -> sequence-side submodule of MoT block i
+    ESM2_LAYER_MAP = {
+        "attention.LayerNorm": "norm_seq",
+        "attention.self.query": "seq_Q",
+        "attention.self.key": "seq_K",
+        "attention.self.value": "seq_V",
+        "attention.output.dense": "seq_out",
+        "LayerNorm": "seq_ffn.norm",
+        "intermediate.dense": "seq_ffn.in_",
+        "output.dense": "seq_ffn.out",
+    }
+    STRUCT_SIDE = re.compile(r"\.(norm_struct|str_[QKV]|struct_out|struct_ffn)\.")
+
+    @torch.no_grad()
+    def load_esm2(self, esm_state_dict: dict[str, torch.Tensor]) -> None:
+        """Load ESM2's encoder layers into the sequence side of every block, plus its RoPE
+        frequencies (fp16-rounded in the checkpoint). Structure-side parameters keep their init.
+        Fails on shape mismatch (e.g. mlp_d), extra checkpoint layers, or any sequence-side
+        parameter left unloaded (checkpoint with fewer layers than n_blocks)."""
+        layer_key = re.compile(r"esm\.encoder\.layer\.(\d+)\.(.+)\.(weight|bias)")
+        mapped = {}
+        for k, v in esm_state_dict.items():
+            r = layer_key.fullmatch(k)
+            if r and r[2] in self.ESM2_LAYER_MAP:
+                mapped[f"layers.{r[1]}.{self.ESM2_LAYER_MAP[r[2]]}.{r[3]}"] = v
+        inv_freq = [v for k, v in esm_state_dict.items() if k.endswith("rotary_embeddings.inv_freq")]
+        assert inv_freq, "no rotary inv_freq in the ESM2 checkpoint"
+        mapped["inv_freq"] = inv_freq[0]
+        missing, unexpected = self.load_state_dict(mapped, strict=False)
+        assert not unexpected, f"ESM2 checkpoint has layers this trunk lacks: {unexpected[:3]}"
+        unloaded = [k for k in missing if not self.STRUCT_SIDE.search(k)]
+        assert not unloaded, f"sequence-side parameters not in the checkpoint: {unloaded[:3]}"
+
     def forward(self, x_seq, x_struct, seq_mask, struct_mask, idx):
         pos = torch.cat((idx, idx), dim=1)  # (B, 2L): seq i and struct i share a position
         # computed once, reused by every block
@@ -254,3 +435,91 @@ class StackMoT(nn.Module):
         for layer in self.layers:
             x_seq, x_struct = layer(x_seq, x_struct, seq_mask, struct_mask, rope)
         return x_seq, x_struct
+
+
+class SimpleDesign(nn.Module):
+    """InputEmbeddings -> StackMoT trunk -> final LN per modality -> heads.
+
+    Returns sequence logits (B, L, 33) over the ESM2 alphabet and the structure velocity field
+    (B, L, 3). Build from scratch with the constructor, or ESM2-initialized with `from_esm2`.
+    """
+
+    ESM2_FINAL_LN = "esm.encoder.emb_layer_norm_after."
+
+    def __init__(
+        self,
+        model_d: int,
+        n_blocks: int,
+        num_heads: int,
+        *,
+        sigma: float,
+        mlp_d: int | None = None,
+        struct_norm: str = "adaln",
+    ):
+        super().__init__()
+        if mlp_d is None:
+            mlp_d = 4 * model_d  # ESM2 uses 4 * hidden_size
+        self.input_embeddings = InputEmbeddings(model_d, sigma)
+        self.trunk = StackMoT(n_blocks, model_d, mlp_d, num_heads)
+        # pre-norm trunk: the residual stream is never normalized, so each modality gets a final
+        # LN before its head (the sequence one is ESM2's emb_layer_norm_after)
+        self.final_ln_seq = nn.LayerNorm(model_d)
+        self.final_ln_struct = nn.LayerNorm(model_d)
+        self.seq_head = SequenceOutputHead(model_d, self.input_embeddings.seq_emb.embed.weight)
+        self.struct_head = StructureOutputHead(model_d, model_d, norm=struct_norm)
+
+    @torch.no_grad()
+    def load_esm2(self, esm_state_dict: dict[str, torch.Tensor]) -> None:
+        """Initialize every sequence-side module from an ESM2 checkpoint state dict: token
+        embedding (tied to the LM-head decoder), trunk layers + RoPE frequencies, final LN,
+        LM head. Structure-side modules keep their init."""
+        self.input_embeddings.load_esm2(esm_state_dict)
+        self.trunk.load_esm2(esm_state_dict)
+        self.final_ln_seq.weight.copy_(esm_state_dict[self.ESM2_FINAL_LN + "weight"])
+        self.final_ln_seq.bias.copy_(esm_state_dict[self.ESM2_FINAL_LN + "bias"])
+        self.seq_head.load_esm2(esm_state_dict)
+
+    @classmethod
+    def from_esm2(cls, ckpt_dir: str | Path, *, sigma: float, struct_norm: str = "adaln"):
+        """Size the model from the checkpoint's config.json and load its weights, e.g.
+        SimpleDesign.from_esm2("checkpoints/esm2_t6_8M_UR50D", sigma=0.1)."""
+        ckpt_dir = Path(ckpt_dir)
+        cfg = json.loads((ckpt_dir / "config.json").read_text())
+        assert cfg["position_embedding_type"] == "rotary" and cfg["token_dropout"], (
+            "SimpleDesign assumes an ESM2 checkpoint (rotary positions, token_dropout)"
+        )
+        model = cls(
+            model_d=cfg["hidden_size"],
+            n_blocks=cfg["num_hidden_layers"],
+            num_heads=cfg["num_attention_heads"],
+            mlp_d=cfg["intermediate_size"],
+            sigma=sigma,
+            struct_norm=struct_norm,
+        )
+        model.load_esm2(load_file(ckpt_dir / "model.safetensors"))
+        return model
+
+    def forward(
+        self,
+        seq: torch.Tensor,
+        coords: torch.Tensor,
+        seq_mask: torch.Tensor,
+        struct_mask: torch.Tensor,
+        idx: torch.Tensor,
+        t: torch.Tensor,
+        t_prime: torch.Tensor,
+    ):
+        """
+        seq:         (B, L) long   ESM2 token ids incl. <cls>/<eos>, <mask> where corrupted
+        coords:      (B, L, 3)     noisy coordinates at t' (any value at <cls>/<eos>/pad slots)
+        seq_mask:    (B, L) bool   real tokens, incl. <cls>/<eos>
+        struct_mask: (B, L) bool   real residues only (no <cls>/<eos>/pad)
+        idx:         (B, L) long   residue index, shared by both modalities (PE + RoPE)
+        t, t_prime:  (B,) float    sequence / structure noise levels
+        -> logits (B, L, 33), velocity (B, L, 3)
+        """
+        x_seq, x_struct = self.input_embeddings(seq, coords, seq_mask, idx, t, t_prime)
+        x_seq, x_struct = self.trunk(x_seq, x_struct, seq_mask, struct_mask, idx)
+        logits = self.seq_head(self.final_ln_seq(x_seq))
+        velocity = self.struct_head(self.final_ln_struct(x_struct), t_prime)
+        return logits, velocity

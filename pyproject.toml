@@ -8,6 +8,7 @@ dependencies = [
     "einops>=0.8.2",
     "matplotlib>=3.11.2",
     "numpy>=2.5.3",
+    "safetensors>=0.8.0",
     "torch>=2.14.0",
     "transformers>=5.17.0",
 ]

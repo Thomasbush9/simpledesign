@@ -2512,6 +2512,7 @@ dependencies = [
     { name = "einops" },
     { name = "matplotlib" },
     { name = "numpy" },
+    { name = "safetensors" },
     { name = "torch" },
     { name = "transformers" },
 ]
@@ -2530,6 +2531,7 @@ requires-dist = [
     { name = "einops", specifier = ">=0.8.2" },
     { name = "matplotlib", specifier = ">=3.11.2" },
     { name = "numpy", specifier = ">=2.5.3" },
+    { name = "safetensors", specifier = ">=0.8.0" },
     { name = "torch", specifier = ">=2.14.0" },
     { name = "transformers", specifier = ">=5.17.0" },
 ]
