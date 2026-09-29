@@ -16,16 +16,20 @@ class MLP(nn.Module):
         self.in_ = nn.Linear(d_in, d)
         self.out = nn.Linear(d, d_in)
         self.act = nn.GELU()
-    def forward(self, x:torch.Tensor):
-        return self.out(self.act(self.in_(self.norm(x))))      
-        
+
+    def forward(self, x: torch.Tensor):
+        return self.out(self.act(self.in_(self.norm(x))))
+
+
 class MoT(nn.Module):
-    def __init__(self, model_d:int, mlp_d:int, num_heads:int=4):
+    def __init__(self, model_d: int, mlp_d: int, num_heads: int = 4):
         # sequence modality specific QKV
-        #TODO: remove the d_seq, d_struct -> single dim for stackabl modules
+        # TODO: remove the d_seq, d_struct -> single dim for stackabl modules
         super().__init__()
-        self.num_heads=num_heads
-        assert model_d % num_heads==0, f"Model dimension must be divisible by number of heads {num_heads}"
+        self.num_heads = num_heads
+        assert model_d % num_heads == 0, (
+            f"Model dimension must be divisible by number of heads {num_heads}"
+        )
         self.d = model_d // num_heads
 
         self.seq_Q = nn.Linear(model_d, model_d)
@@ -41,43 +45,60 @@ class MoT(nn.Module):
         self.seq_out = nn.Linear(model_d, model_d)
         self.struct_out = nn.Linear(model_d, model_d)
 
-
         self.seq_ffn = MLP(model_d, mlp_d)
         self.struct_ffn = MLP(model_d, mlp_d)
 
-    def forward(self, x_seq:torch.Tensor, x_struct:torch.Tensor, mask:torch.Tensor, rope):
+    def forward(
+        self,
+        x_seq: torch.Tensor,
+        x_struct: torch.Tensor,
+        seq_mask: torch.Tensor,
+        struct_mask: torch.Tensor,
+        rope,
+    ):
         assert x_seq.shape[1] == x_struct.shape[1], "Inputs must have the same length"
+        # TODO: accept a single mask if the other is not specified use single one
+        assert seq_mask.shape == struct_mask.shape, "Mask must have same dimensions"
         seq_len = x_seq.shape[1]
-        #TODO: fix this to not overwrite the residual stream
         x_seq_norm = self.norm_seq(x_seq)
         x_struct_norm = self.norm_struct(x_struct)
         seq_Q, seq_K, seq_V = self.seq_Q(x_seq_norm), self.seq_K(x_seq_norm), self.seq_V(x_seq_norm)
-        str_Q, str_K, str_V = self.str_Q(x_struct_norm), self.str_K(x_struct_norm), self.str_V(x_struct_norm)
-        # we now concatenate the Q, K and V for both modalities: 
+        str_Q, str_K, str_V = (
+            self.str_Q(x_struct_norm),
+            self.str_K(x_struct_norm),
+            self.str_V(x_struct_norm),
+        )
+        # we now concatenate the Q, K and V for both modalities:
         # B, L+L, D
-        joint_Q = rearrange(torch.cat((seq_Q, str_Q), dim=1), "b l (h d_k) -> b h l d_k", h=self.num_heads)
-        joint_K = rearrange(torch.cat((seq_K, str_K), dim=1), "b l (h d_k) -> b h l d_k", h=self.num_heads)
-        joint_V = rearrange(torch.cat((seq_V, str_V), dim=1), "b l (h d_k) -> b h l d_k", h=self.num_heads)
+        joint_Q = rearrange(
+            torch.cat((seq_Q, str_Q), dim=1), "b l (h d_k) -> b h l d_k", h=self.num_heads
+        )
+        joint_K = rearrange(
+            torch.cat((seq_K, str_K), dim=1), "b l (h d_k) -> b h l d_k", h=self.num_heads
+        )
+        joint_V = rearrange(
+            torch.cat((seq_V, str_V), dim=1), "b l (h d_k) -> b h l d_k", h=self.num_heads
+        )
         cos, sin = rope
         joint_Q = apply_rope(joint_Q, cos, sin)
         joint_K = apply_rope(joint_K, cos, sin)
-        # apply the mask 
+        # apply the mask
         attn_scores = torch.einsum("...ld, ...zd->...lz", joint_Q, joint_K) / math.sqrt(self.d)
-        joint_mask = torch.cat((mask, mask), dim=1) # B, 2L
+        joint_mask = torch.cat((seq_mask, struct_mask), dim=1)
         key_mask = rearrange(joint_mask, "b j -> b 1 1 j")
         attn_scores = attn_scores.masked_fill(~key_mask, -torch.inf)
         probs = F.softmax(attn_scores, dim=-1)
         out = torch.einsum("...ij, ...jd->...id", probs, joint_V)
-        # divide the modalities 
+        # divide the modalities
         out = rearrange(out, "b h l d_k -> b l (h d_k)", h=self.num_heads)
         seq_out, struct_out = out[:, :seq_len], out[:, seq_len:]
         seq_out = self.seq_out(seq_out)
-        #residual + norm after mha
+        # residual + norm after mha
         x_seq = x_seq + seq_out
         struct_out = self.struct_out(struct_out)
         x_struct = x_struct + struct_out
-        
-        #MLP -> norm is inside the mlp
+
+        # MLP -> norm is inside the mlp
         seq_out = self.seq_ffn(x_seq)
         x_seq = x_seq + seq_out
         struct_out = self.struct_ffn(x_struct)
@@ -86,14 +107,19 @@ class MoT(nn.Module):
 
 
 class StackMoT(nn.Module):
-    def __init__(self, n_blocks, model_d, mlp_d, num_heads):
+    def __init__(self, n_blocks, model_d, mlp_d, num_heads, rope_base: float = 10_000.0):
         super().__init__()
         self.d_k = model_d // num_heads
         self.layers = nn.ModuleList([MoT(model_d, mlp_d, num_heads) for _ in range(n_blocks)])
+        # RoPE frequencies: a buffer so they follow .to(device) and are saved in the state_dict.
+        # Loading an ESM2 checkpoint overwrites them with its fp16-rounded values.
+        inv_freq = rope_base ** (-torch.arange(0, self.d_k, 2, dtype=torch.float32) / self.d_k)
+        self.register_buffer("inv_freq", inv_freq)
 
-    def forward(self, x_seq, x_struct, mask, idx):
-        pos = torch.cat((idx, idx), dim=1)            # (B, 2L): seq i and struct i share a position
-        rope = rope_cos_sin(pos, self.d_k)            # computed once, reused by every block
+    def forward(self, x_seq, x_struct, seq_mask, struct_mask, idx):
+        pos = torch.cat((idx, idx), dim=1)  # (B, 2L): seq i and struct i share a position
+        # computed once, reused by every block
+        rope = rope_cos_sin(pos, self.d_k, inv_freq=self.inv_freq)
         for layer in self.layers:
-            x_seq, x_struct = layer(x_seq, x_struct, mask, rope)
+            x_seq, x_struct = layer(x_seq, x_struct, seq_mask, struct_mask, rope)
         return x_seq, x_struct
