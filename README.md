@@ -18,6 +18,31 @@ uv run hf download facebook/esm2_t6_8M_UR50D \
 
 Swap the repo id for larger models (`esm2_t12_35M_UR50D`, `esm2_t33_650M_UR50D`).
 
+## Data
+
+A dataset directory pairs structures and sequences by file stem:
+
+```
+<root>/
+  structures/<id>.cif | <id>.pdb   single protein chain
+  fasta/<id>.fasta                  one record (header ignored)
+  summary.tsv                       optional, tab-separated, `id` + `length` columns
+```
+
+```python
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
+from simpledesign.data.dataset import ProteinCollator, ProteinDataset
+
+ds = ProteinDataset("<root>")   # fails on unpaired files
+ds.validate()                    # optional: check every structure/FASTA pair up front
+tok = AutoTokenizer.from_pretrained("checkpoints/esm2_t6_8M_UR50D")
+loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=ProteinCollator(tok))
+```
+
+Each item's structure sequence must equal its FASTA sequence (and `length` in `summary.tsv`).
+Batches carry `seq`, `coords`, `seq_mask`, `struct_mask`, `idx` for `SimpleDesign.forward`.
+
 ## Layout
 
 ```
