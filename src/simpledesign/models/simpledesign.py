@@ -182,6 +182,7 @@ class MoT(nn.Module):
         self.str_Q = nn.Linear(model_d, model_d)
         self.str_K = nn.Linear(model_d, model_d)
         self.str_V = nn.Linear(model_d, model_d)
+        self.attn_probe = nn.Identity()
         self.norm_seq = nn.LayerNorm(model_d)
         self.norm_struct = nn.LayerNorm(model_d)
 
@@ -231,6 +232,7 @@ class MoT(nn.Module):
         key_mask = rearrange(joint_mask, "b j -> b 1 1 j")
         attn_scores = attn_scores.masked_fill(~key_mask, -torch.inf)
         probs = F.softmax(attn_scores, dim=-1)
+        probs = self.attn_probe(probs)
         out = torch.einsum("...ij, ...jd->...id", probs, joint_V)
         # divide the modalities
         out = rearrange(out, "b h l d_k -> b l (h d_k)", h=self.num_heads)
@@ -420,7 +422,9 @@ class StackMoT(nn.Module):
             r = layer_key.fullmatch(k)
             if r and r[2] in self.ESM2_LAYER_MAP:
                 mapped[f"layers.{r[1]}.{self.ESM2_LAYER_MAP[r[2]]}.{r[3]}"] = v
-        inv_freq = [v for k, v in esm_state_dict.items() if k.endswith("rotary_embeddings.inv_freq")]
+        inv_freq = [
+            v for k, v in esm_state_dict.items() if k.endswith("rotary_embeddings.inv_freq")
+        ]
         assert inv_freq, "no rotary inv_freq in the ESM2 checkpoint"
         mapped["inv_freq"] = inv_freq[0]
         missing, unexpected = self.load_state_dict(mapped, strict=False)
