@@ -14,9 +14,9 @@ num_workers: 0
 cache: true
 
 # optimization
-num_steps: 10000
+num_steps: 20000
 lr: 1.0e-4
-weight_decay: 0.0
+weight_decay: 0.01
 grad_clip: 1.0
 lambda_seq: 1.0
 lambda_struct: 1.0
@@ -25,16 +25,18 @@ fixed_corruption: false
 translation_std: 0.0  # Angstrom
 
 # logging / outputs
-out_dir: runs/debug
-log_every: 500
+out_dir: runs/mps-20k
+log_every: 1000
 plot_history: true
 plot_smooth: 20
-use_wandb: false
+plot_every: 1000      # null: off; velocity + sequence figures -> out_dir/viz (+ wandb)
+viz_levels: [0.25, 0.5, 0.75]  # t = t' of each figure row
+use_wandb: true
 wandb_project: simpledesign
-wandb_name: null
+wandb_name: mps-20k
 
 # checkpoints
-ckpt_dir: null        # e.g. runs/debug/ckpt
+ckpt_dir: runs/mps-20k/ckpt        # e.g. runs/debug/ckpt
 ckpt_every: 1000
 ckpt_keep_all: false  # false: overwrite last.pt
 resume_from: null     # e.g. runs/debug/ckpt/last.pt

@@ -22,7 +22,7 @@ from simpledesign.models.utils import (
     corrupt,
     sample_timesteps,
 )
-from simpledesign.viz.visualization import plot_history
+from simpledesign.viz.visualization import plot_history, plot_sequence, plot_velocity
 
 SCALARS = ("total", "seq", "struct", "acc", "grad_norm")
 
@@ -54,6 +54,8 @@ class TrainerArgs:
     log_every: int = 100
     plot_history: bool = True
     plot_smooth: int = 20
+    plot_every: int | None = None  # None: off; velocity/sequence figures of a fixed protein
+    viz_levels: tuple[float, ...] = (0.25, 0.5, 0.75)  # t = t' of each figure row
     use_wandb: bool = False
     wandb_project: str = "simpledesign"
     wandb_name: str | None = None
@@ -83,6 +85,7 @@ class Trainer:
         )
         self.step = 0
         self.history = []
+        self._viz = None  # (batch, views) for plot(), built on first use
         if args.resume_from:
             self.load(args.resume_from)
         # different noise per rank, and no replay of the first steps' noise after a resume
@@ -226,6 +229,67 @@ class Trainer:
         if self.is_main:
             print(f"resumed from {path} at step {self.step}")
 
+    def viz_inputs(self) -> tuple[dict, dict]:
+        """First dataset protein, one row per viz level (t = t'), no augmentation. Built on CPU
+        under a fixed seed: the same crop and noise in every figure, also across resumes."""
+        levels = torch.tensor(self.args.viz_levels, dtype=torch.float32)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(self.args.seed)
+            batch = self.loader.collate_fn([self.loader.dataset[0]])
+            b = {
+                k: v.repeat_interleave(len(levels), dim=0)
+                for k, v in batch.items()
+                if isinstance(v, torch.Tensor)
+            }
+            seq_t, coords_t, noise_mask, _, eps, x_clean = corrupt(b, levels, levels)
+        v = {
+            "t": levels,
+            "t_prime": levels,
+            "seq_t": seq_t,
+            "coords_t": coords_t,
+            "noise_mask": noise_mask,
+            "eps": eps,
+            "x_clean": x_clean,
+        }
+        b = {k: x.to(self.device) for k, x in b.items()}
+        return b, {k: x.to(self.device) for k, x in v.items()}
+
+    @torch.no_grad()
+    def plot(self) -> None:
+        """Velocity + sequence figures -> out_dir/viz/<name>_<step>.png and wandb viz/<name>."""
+        if self._viz is None:
+            self._viz = self.viz_inputs()
+        b, v = self._viz
+        self.model.eval()  # bare model: a DDP forward on rank 0 alone could hang
+        logits, velocity = self.model(
+            v["seq_t"],
+            v["coords_t"],
+            b["seq_mask"],
+            b["struct_mask"],
+            b["idx"],
+            v["t"],
+            v["t_prime"],
+        )
+        self.model.train()
+        v_target = aligned_velocity_target(
+            v["x_clean"], v["eps"], v["coords_t"], velocity, v["t_prime"], b["struct_mask"]
+        )
+        figs = {
+            "velocity": plot_velocity(
+                v["coords_t"], velocity, v_target, v["t_prime"], b["struct_mask"]
+            ),
+            "sequence": plot_sequence(logits, b["seq"], v["noise_mask"], v["t"], b["struct_mask"]),
+        }
+        out = Path(self.args.out_dir) / "viz"
+        out.mkdir(parents=True, exist_ok=True)
+        for name, fig in figs.items():
+            fig.suptitle(f"step {self.step}")
+            fig.savefig(out / f"{name}_{self.step:07d}.png", dpi=120)
+        if self.args.use_wandb:
+            wandb.log({f"viz/{k}": wandb.Image(fig) for k, fig in figs.items()}, step=self.step)
+        for fig in figs.values():
+            plt.close(fig)
+
     def train(self) -> SimpleDesign:
         a = self.args
         if self.is_main:
@@ -256,11 +320,15 @@ class Trainer:
             buffer.append((self.step, stats))
             last = self.step == a.num_steps
             save = a.ckpt_dir is not None and (self.step % a.ckpt_every == 0 or last)
-            if self.step % a.log_every == 0 or save or last:
+            plot = a.plot_every is not None and (self.step % a.plot_every == 0 or last)
+            # flush before saving/plotting: wandb drops rows logged at a step below the current one
+            if self.step % a.log_every == 0 or save or plot or last:
                 self.log(buffer)
                 buffer = []
             if save:
                 self.save()
+            if plot:
+                self.plot()
 
         if self.is_main:
             if a.plot_history and self.history:

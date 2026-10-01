@@ -1,8 +1,13 @@
-import matplotlib.pyplot as plt
-import torch
-import numpy as np
 import math
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
 from matplotlib.colors import LogNorm
+
+from simpledesign.models.loss import AA_IDS
+
+ESM2_AAS = "LAGVSERTIDPKQNFYMHWC"  # ESM2 token ids 4..23 (AA_IDS)
 
 
 def plot_history(history, smooth=1, t_bins=(0.0, 0.3, 0.7, 1.0)):
@@ -125,4 +130,70 @@ def plot_attention(attn, batch, b=0, heads=None, log_scale=True, drop_special=Fa
         ax.axis("off")
     fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.6, label="attention weight")
     fig.suptitle(f"{batch['ids'][b]}: rows = queries, cols = keys  [seq | struct]")
+    return fig
+
+
+def plot_velocity(coords_t, v_pred, v_true, t_prime, struct_mask, dims=((0, 1), (0, 2), (1, 2))):
+    """Predicted vs target velocity field, one row per protein view (e.g. one protein at several
+    t'), one column per 2D projection of the coordinates (nm).
+
+    Gray: input coordinates x_t'. Arrows are velocity * (1 - t'): each one ends where a single
+    Euler step to t' = 1 moves the residue, green for the target, red for the prediction; the
+    endpoints are joined into CA traces (the target / predicted protein).
+    coords_t, v_pred, v_true: (B, L, 3); t_prime: (B,); struct_mask: (B, L) bool.
+    """
+    n = coords_t.shape[0]
+    fig, axes = plt.subplots(
+        n, len(dims), figsize=(4.5 * len(dims), 4.5 * n), squeeze=False, constrained_layout=True
+    )
+    for i in range(n):
+        m = struct_mask[i].cpu()
+        x = coords_t[i].float().cpu()[m]
+        vp, vt = v_pred[i].float().cpu()[m], v_true[i].float().cpu()[m]
+        dt = 1 - float(t_prime[i])
+        rmse = ((vp - vt) ** 2).sum(-1).mean().sqrt()
+        cos = torch.nn.functional.cosine_similarity(vp, vt, dim=-1).mean()
+        for ax, (a, c) in zip(axes[i], dims, strict=True):
+            ax.scatter(x[:, a], x[:, c], s=8, c="gray", alpha=0.6, label="input $x_{t'}$")
+            for v, color, name in ((vt, "tab:green", "target"), (vp, "tab:red", "predicted")):
+                d = v * dt
+                ax.quiver(
+                    x[:, a], x[:, c], d[:, a], d[:, c], color=color, alpha=0.4,
+                    angles="xy", scale_units="xy", scale=1, width=0.003,
+                )  # fmt: skip
+                end = x + d
+                ax.plot(end[:, a], end[:, c], "-o", color=color, ms=2, lw=0.8, label=name)
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.set_xlabel(f"{'xyz'[a]} (nm)")
+            ax.set_ylabel(f"{'xyz'[c]} (nm)")
+            ax.grid(alpha=0.3)
+        axes[i][0].set_title(f"t'={float(t_prime[i]):.2f} | v RMSE {rmse:.3f} nm | cos {cos:.2f}")
+    axes[0][-1].legend(fontsize=8, loc="upper right")
+    return fig
+
+
+def plot_sequence(logits, seq, noise_mask, t, struct_mask):
+    """Predicted amino-acid distribution per residue, one row per protein view (e.g. one protein
+    at several t). Heatmap: softmax over the 20 amino acids (as in the loss). Red circles: true
+    residue at masked (scored) positions, white dots: true residue at visible positions.
+    logits: (B, L, 33); seq: (B, L) clean tokens; noise_mask, struct_mask: (B, L) bool; t: (B,).
+    """
+    n = logits.shape[0]
+    fig, axes = plt.subplots(n, 1, figsize=(16, 2.8 * n), squeeze=False, constrained_layout=True)
+    for i, ax in enumerate(axes[:, 0]):
+        m = struct_mask[i].cpu()
+        p = logits[i].float().cpu()[m][:, AA_IDS].softmax(-1).T  # (20, L)
+        true = seq[i].cpu()[m] - AA_IDS.start
+        masked = noise_mask[i].cpu()[m]
+        valid = (true >= 0) & (true < len(ESM2_AAS))
+        pos = torch.arange(len(true))
+        im = ax.imshow(p, aspect="auto", cmap="viridis", vmin=0, vmax=1, interpolation="nearest")
+        sel = masked & valid
+        ax.scatter(pos[sel], true[sel], s=14, facecolors="none", edgecolors="red", lw=0.9)
+        ax.scatter(pos[~masked & valid], true[~masked & valid], s=3, c="white")
+        acc = (p.argmax(0) == true)[sel].float().mean()
+        ax.set_yticks(range(len(ESM2_AAS)), list(ESM2_AAS), fontsize=6)
+        ax.set_title(f"t={float(t[i]):.2f} | {int(sel.sum())} masked | masked acc {acc:.2f}")
+    axes[-1, 0].set_xlabel("residue")
+    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.8, label="p(aa)")
     return fig

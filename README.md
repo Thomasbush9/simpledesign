@@ -59,6 +59,11 @@ uv run torchrun --standalone --nproc_per_node=4 scripts/train.py --config <yaml>
   (+ `translation_std` shift), `t`, `t'`, sequence mask and noise. Rank `r` seeds with `seed + r`.
 - `out_dir` receives `history.png` at the end (and `wandb/` if `use_wandb: true`; on nodes without
   internet set `WANDB_MODE=offline`, then `wandb sync`).
+- `plot_every: N`: every N steps (and at the end) the first dataset protein is corrupted at each
+  `viz_levels` value (t = t', same noise every time) and plotted: `velocity_<step>.png`
+  (input coordinates, target vs predicted velocity arrows and the CA traces they lead to) and
+  `sequence_<step>.png` (predicted amino-acid probabilities, true residues marked) in
+  `out_dir/viz/`, and as `viz/velocity`, `viz/sequence` on wandb.
 - `ckpt_dir` set: checkpoint every `ckpt_every` steps and at the end, overwriting `last.pt`
   (`ckpt_keep_all: true` keeps `step_XXXXXXX.pt`). Writes are atomic.
 - `resume_from: <ckpt>` restores model, optimizer, step and history, then trains up to `num_steps`.
