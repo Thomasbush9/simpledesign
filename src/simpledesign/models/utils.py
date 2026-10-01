@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+SIGMA_DATA = 10.0  # Angstrom per model unit: coordinates enter the model in nm
+
 
 def sinusoidal(x: torch.Tensor, dim: int, max_period: float = 10_000.0) -> torch.Tensor:
     """Sinusoidal features of a scalar per element: x (...) -> (..., dim), computed in float32.
@@ -52,3 +54,113 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     """x: (B, H, N, d_k). Rotates pairs (i, i + d_k/2)."""
     xf = x.float()
     return (xf * cos + rotate_half(xf) * sin).type_as(x)
+
+
+def sample_timesteps(B: int, device: str = "cpu"):
+    """Sample t and t_prime for a given batch.
+
+    Args:
+        B: int Batch size
+        device: cpu, mps or cuda
+    Returns:
+        t: torch.Tensor [0,1] uniform sampling for sequence noise levels 0: full noise
+        t_prime : torch.Tensor [0, 1] structure noise level sampled from combination of Beta (1.9, 1.0) and uniform -> to ensure more data close to 1.0
+    """
+    # sequence
+    t = torch.rand(B, device=device)
+    # structure
+    use_beta = torch.rand(B, device=device) < 0.98
+    beta = torch.distributions.Beta(1.9, 1.0).sample((B,)).to(device)
+    uniform = torch.rand(B, device=device)
+    t_prime = torch.where(use_beta, beta, uniform)
+    return t, t_prime
+
+
+def random_rotations(B: int, device: str | torch.device = "cpu") -> torch.Tensor:
+    """(B, 3, 3) rotation matrices, uniform over SO(3) (normalized Gaussian quaternions)."""
+    q = torch.randn(B, 4, device=device)
+    w, x, y, z = (q / q.norm(dim=-1, keepdim=True)).unbind(-1)
+    return torch.stack(
+        (
+            1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+            2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+            2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+        ),
+        dim=-1,
+    ).view(B, 3, 3)  # fmt: skip
+
+
+def augment(coords: torch.Tensor, struct_mask: torch.Tensor, translation_std: float = 0.0):
+    """Random rigid motion per protein: center on the real residues, rotate uniformly, shift by
+    N(0, translation_std^2) (same unit as coords). coords (B, L, 3) -> (B, L, 3), 0 outside mask.
+    """
+    B = coords.shape[0]
+    m = struct_mask[..., None].to(coords.dtype)
+    mu = (coords * m).sum(dim=1, keepdim=True) / m.sum(dim=1, keepdim=True)
+    R = random_rotations(B, coords.device)
+    shift = translation_std * torch.randn(B, 1, 3, device=coords.device)
+    return ((coords - mu) @ R.transpose(-1, -2) + shift) * m
+
+
+def corrupt(batch: dict, t: torch.Tensor, t_prime: torch.Tensor):
+    """
+    It corrupts a single batch using the noise levels t, t_prime for sequence and structure.
+
+    Args:
+        batch: dict = ProteinCollator output (coords in Angstrom)
+        t: torch.Tensor= sequence noise level (B,)
+        t_prime: torch.Tensor = structure noise level (B,)
+    Returns: seq_t, x_t, seq_noise_mask, v (unaligned target), epsilon, x_clean (nm)
+    """
+    B = batch["seq"].shape[0]
+    L = batch["seq"].shape[-1]
+    dev = batch["seq"].device
+    seq_noise_mask = (torch.rand(B, L, device=dev) < (1 - t)[:, None]) & batch["struct_mask"]
+    seq_t = batch["seq"].masked_fill(seq_noise_mask, 32)
+    x_clean = batch["coords"] / SIGMA_DATA
+    epsilon = torch.randn(B, L, 3, device=dev)
+    # set zero outside the mask
+    m = batch["struct_mask"][..., None].to(epsilon.dtype)  # (B, L, 1): 1 at real
+    epsilon = epsilon * m  # zero padding / <cls> /
+    c = epsilon.sum(dim=1, keepdim=True) / m.sum(dim=1, keepdim=True)  # (B, 1, 3):
+    epsilon = (epsilon - c) * m
+    # interpolate
+    x_prime = (1 - t_prime)[:, None, None] * epsilon + t_prime[:, None, None] * x_clean
+    # get velocity target:
+    v = x_clean - epsilon
+    return seq_t, x_prime, seq_noise_mask, v, epsilon, x_clean
+
+
+def structure_rigid_alignment(coords: torch.Tensor, ref_coords: torch.Tensor, mask: torch.Tensor):
+    """Kabsch: rotate + translate `coords` onto `ref_coords`, per protein.
+
+    coords, ref_coords: (B, L, 3); mask: (B, L) bool, True at real residues.
+    Returns the aligned coords (B, L, 3), zero outside the mask. Proper rotations only
+    (no reflections). Wrap the call in torch.no_grad() when used inside the loss.
+    """
+    m = mask[..., None].to(coords.dtype)  # (B, L, 1)
+    n = m.sum(dim=1, keepdim=True)  # (B, 1, 1)
+    # centroids over real residues only
+    mu = (coords * m).sum(dim=1, keepdim=True) / n  # (B, 1, 3)
+    mu_ref = (ref_coords * m).sum(dim=1, keepdim=True) / n
+    x = (coords - mu) * m
+    x_ref = (ref_coords - mu_ref) * m
+    # cross-covariance H = sum_l x_ref_l (outer) x_l, then SVD per protein
+    H = torch.einsum("bli,blj->bij", x_ref, x)  # (B, 3, 3)
+    U, S, Vh = torch.linalg.svd(H)
+    # reflection fix, per protein: flip the last axis where det(U Vh) = -1
+    d = torch.sign(torch.linalg.det(U @ Vh))  # (B,)
+    D = torch.diag_embed(torch.stack((torch.ones_like(d), torch.ones_like(d), d), dim=-1))
+    R = U @ D @ Vh  # (B, 3, 3),rotates x onto x_ref
+    # coordinates are row vectors: x_aligned = x R^T, then move to the reference centroid
+    return (x @ R.transpose(-1, -2) + mu_ref) * m
+
+
+def aligned_velocity_target(x_clean, eps, coords_t, v_pred, t_prime, struct_mask):
+    """Rotate/translate the ground truth onto the model's predicted structure, rebuild the target.
+    Alignment runs in fp32 with autocast off (SVD has no bf16 kernels)."""
+    with torch.no_grad(), torch.autocast(x_clean.device.type, enabled=False):
+        x1_hat = coords_t.float() + (1 - t_prime.float())[:, None, None] * v_pred.float()
+        x1_aligned = structure_rigid_alignment(x_clean.float(), x1_hat, struct_mask)
+    m = struct_mask[..., None].to(x1_aligned.dtype)
+    return (x1_aligned - eps.float()) * m
