@@ -9,9 +9,12 @@ dependencies = [
     "einops>=0.8.2",
     "matplotlib>=3.11.2",
     "numpy>=2.5.3",
+    "pyyaml>=6.0.3",
+    "rich>=15.0.0",
     "safetensors>=0.8.0",
     "torch>=2.14.0",
     "transformers>=5.17.0",
+    "wandb>=0.30.0",
 ]
 
 [build-system]

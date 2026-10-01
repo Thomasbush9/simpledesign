@@ -42,6 +42,26 @@ loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=ProteinCollator(t
 
 Each item's structure sequence must equal its FASTA sequence (and `length` in `summary.tsv`).
 Batches carry `seq`, `coords`, `seq_mask`, `struct_mask`, `idx` for `SimpleDesign.forward`.
+`ProteinDataset(..., cache=True)` parses each protein once; `ProteinCollator(tok, max_len=256)`
+randomly crops longer proteins.
+
+## Training
+
+Every key in `configs/train_config.yaml` is a `TrainerArgs` field
+(`src/simpledesign/training/train.py`).
+
+```bash
+uv run python scripts/train.py --config configs/train_config.yaml                  # cuda > mps > cpu
+uv run torchrun --standalone --nproc_per_node=4 scripts/train.py --config <yaml>  # DDP, one node
+```
+
+- Each protein is repeated `n_replicas` times; every replica gets its own random rotation
+  (+ `translation_std` shift), `t`, `t'`, sequence mask and noise. Rank `r` seeds with `seed + r`.
+- `out_dir` receives `history.png` at the end (and `wandb/` if `use_wandb: true`; on nodes without
+  internet set `WANDB_MODE=offline`, then `wandb sync`).
+- `ckpt_dir` set: checkpoint every `ckpt_every` steps and at the end, overwriting `last.pt`
+  (`ckpt_keep_all: true` keeps `step_XXXXXXX.pt`). Writes are atomic.
+- `resume_from: <ckpt>` restores model, optimizer, step and history, then trains up to `num_steps`.
 
 ## Layout
 

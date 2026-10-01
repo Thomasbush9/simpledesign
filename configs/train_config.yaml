@@ -1,0 +1,40 @@
+# SimpleDesign training: one key per TrainerArgs field (src/simpledesign/training/train.py)
+# YAML floats need a dot: 1.0e-4, not 1e-4 (parsed as a string)
+
+# model
+esm_ck: checkpoints/esm2_t6_8M_UR50D
+sigma: 1.0
+
+# data
+data_dir: /Users/thomasbush/Downloads/data_test_simpledesign
+max_len: 256
+batch_size: 4       # proteins per GPU
+n_replicas: 4       # views per protein -> model batch 16
+num_workers: 0
+cache: true
+
+# optimization
+num_steps: 10000
+lr: 1.0e-4
+weight_decay: 0.0
+grad_clip: 1.0
+lambda_seq: 1.0
+lambda_struct: 1.0
+seed: 0
+fixed_corruption: false
+translation_std: 0.0  # Angstrom
+
+# logging / outputs
+out_dir: runs/debug
+log_every: 500
+plot_history: true
+plot_smooth: 20
+use_wandb: false
+wandb_project: simpledesign
+wandb_name: null
+
+# checkpoints
+ckpt_dir: null        # e.g. runs/debug/ckpt
+ckpt_every: 1000
+ckpt_keep_all: false  # false: overwrite last.pt
+resume_from: null     # e.g. runs/debug/ckpt/last.pt
