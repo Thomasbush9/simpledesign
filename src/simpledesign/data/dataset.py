@@ -28,11 +28,13 @@ class ProteinDataset(Dataset):
     two structure files). Every item is validated when loaded: the sequence read from the
     structure must be identical to the FASTA sequence, and to `length` in summary.tsv if present.
     `validate()` checks all items up front and reports every failure at once.
+    cache=True keeps every parsed item in memory (per DataLoader worker: use persistent workers).
     """
 
-    def __init__(self, root: str | Path, center: bool = True):
+    def __init__(self, root: str | Path, center: bool = True, cache: bool = False):
         self.root = Path(root)
         self.center = center
+        self._cache: dict[int, dict] | None = {} if cache else None
         structures: dict[str, Path] = {}
         for path in sorted((self.root / "structures").iterdir()):
             if path.suffix not in STRUCTURE_SUFFIXES:
@@ -67,6 +69,8 @@ class ProteinDataset(Dataset):
     def __getitem__(self, i: int) -> dict:
         """-> {"id", "sequence" (str, L), "coords" (L, 3) float32 in Angstrom (centered on the CA
         centroid if center=True), "b_factor" (L,) float32 (pLDDT for predicted structures)}"""
+        if self._cache is not None and i in self._cache:
+            return self._cache[i]
         pid = self.ids[i]
         structure = read_structure(self.structure_paths[pid])
         sequence = read_fasta(self.fasta_paths[pid])
@@ -82,12 +86,15 @@ class ProteinDataset(Dataset):
         coords = torch.from_numpy(structure.ca_coords)
         if self.center:
             coords = coords - coords.mean(dim=0, keepdim=True)
-        return {
+        item = {
             "id": pid,
             "sequence": sequence,
             "coords": coords,
             "b_factor": torch.from_numpy(structure.b_factor),
         }
+        if self._cache is not None:
+            self._cache[i] = item
+        return item
 
     def validate(self) -> None:
         """Load every item; raise one ValueError listing all failures."""
@@ -118,7 +125,9 @@ class ProteinCollator:
 
     tokenizer: the ESM2 tokenizer, e.g.
     AutoTokenizer.from_pretrained("checkpoints/esm2_t6_8M_UR50D").
-    Output (L = longest protein + 2 for <cls>/<eos>):
+    max_len: proteins longer than this are cropped to a random contiguous window of max_len
+    residues, re-centered on its CA centroid. None: no cropping.
+    Output (L = longest (cropped) protein + 2 for <cls>/<eos>):
         ids          list[str]
         seq          (B, L) long   ESM2 token ids, <pad> = 1
         seq_mask     (B, L) bool   real tokens incl. <cls>/<eos>
@@ -128,10 +137,26 @@ class ProteinCollator:
         idx          (B, L) long   0..L-1, shared by both modalities
     """
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, max_len: int | None = None):
         self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def crop(self, item: dict) -> dict:
+        n = len(item["sequence"])
+        if self.max_len is None or n <= self.max_len:
+            return item
+        s = int(torch.randint(0, n - self.max_len + 1, ()))
+        e = s + self.max_len
+        coords = item["coords"][s:e]
+        return {
+            "id": item["id"],
+            "sequence": item["sequence"][s:e],
+            "coords": coords - coords.mean(dim=0, keepdim=True),
+            "b_factor": item["b_factor"][s:e],
+        }
 
     def __call__(self, items: list[dict]) -> dict:
+        items = [self.crop(item) for item in items]
         enc = self.tokenizer(
             [item["sequence"] for item in items], padding=True, return_tensors="pt"
         )
