@@ -63,3 +63,20 @@ def read_fasta(path: str | Path) -> str:
     if len(records) != 1:
         raise ValueError(f"{path}: expected one FASTA record, found {len(records)}")
     return records[0].upper()
+
+
+def write_ca_structure(path: str | Path, sequence: str, coords: np.ndarray) -> None:
+    """Write a CA-only chain A to .pdb/.cif. coords: (L, 3) Angstrom, or (M, L, 3) for M models
+    (e.g. a sampling trajectory, playable as states in PyMOL)."""
+    coords = np.asarray(coords, dtype=np.float32)
+    stack = coords[None] if coords.ndim == 2 else coords
+    n = len(sequence)
+    assert stack.shape[1:] == (n, 3), f"coords {coords.shape} do not match {n} residues"
+    atoms = struc.AtomArrayStack(len(stack), n)
+    atoms.coord = stack
+    atoms.chain_id[:] = "A"
+    atoms.res_id[:] = np.arange(1, n + 1)
+    atoms.res_name[:] = [ProteinSequence.convert_letter_1to3(aa) for aa in sequence]
+    atoms.atom_name[:] = "CA"
+    atoms.element[:] = "C"
+    strucio.save_structure(path, atoms if len(stack) > 1 else atoms[0])

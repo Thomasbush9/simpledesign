@@ -197,3 +197,39 @@ def plot_sequence(logits, seq, noise_mask, t, struct_mask):
     axes[-1, 0].set_xlabel("residue")
     fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.8, label="p(aa)")
     return fig
+
+
+def plot_samples(samples, true, rmsd=None, dims=((0, 1), (0, 2), (1, 2)), title=None):
+    """Generated structures vs the true one for a single protein.
+
+    samples: (K, N, 3) Angstrom, already Kabsch-aligned onto `true` (N, 3). Columns: CA traces in
+    three 2D projections (black: true, colors: samples), then the histogram of consecutive CA-CA
+    distances (3.8 A for real proteins). rmsd: optional (K,) per-sample RMSD for the legend.
+    """
+    samples, true = samples.float().cpu(), true.float().cpu()
+    fig, axes = plt.subplots(1, len(dims) + 1, figsize=(4.5 * (len(dims) + 1), 4.5))
+    colors = plt.cm.viridis(np.linspace(0, 0.9, len(samples)))
+    for ax, (a, c) in zip(axes, dims, strict=False):
+        ax.plot(true[:, a], true[:, c], "-", color="black", lw=1.6, label="true")
+        for k, (x, color) in enumerate(zip(samples, colors, strict=True)):
+            label = f"sample {k}" + (f" ({float(rmsd[k]):.1f} A)" if rmsd is not None else "")
+            ax.plot(x[:, a], x[:, c], "-", color=color, lw=0.8, alpha=0.7, label=label)
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_xlabel(f"{'xyz'[a]} (A)")
+        ax.set_ylabel(f"{'xyz'[c]} (A)")
+        ax.grid(alpha=0.3)
+    axes[0].legend(fontsize=7)
+    ax = axes[-1]
+    d_true = (true[1:] - true[:-1]).norm(dim=-1)
+    d_samples = (samples[:, 1:] - samples[:, :-1]).norm(dim=-1).flatten()
+    bins = np.linspace(0, max(8.0, float(d_samples.max())), 60)
+    ax.hist(d_samples, bins=bins, alpha=0.6, density=True, label="samples")
+    ax.hist(d_true, bins=bins, histtype="step", color="black", density=True, label="true")
+    ax.axvline(3.8, color="red", ls="--", lw=0.8)
+    ax.set_xlabel("consecutive CA-CA distance (A)")
+    ax.set_title(f"samples {float(d_samples.mean()):.2f} +- {float(d_samples.std()):.2f} A")
+    ax.legend(fontsize=8)
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    return fig

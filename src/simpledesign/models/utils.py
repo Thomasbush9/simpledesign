@@ -5,6 +5,7 @@ import torch.nn as nn
 import numpy as np
 
 SIGMA_DATA = 10.0  # Angstrom per model unit: coordinates enter the model in nm
+MASK_ID = 32  # ESM2 <mask> token
 
 
 def sinusoidal(x: torch.Tensor, dim: int, max_period: float = 10_000.0) -> torch.Tensor:
@@ -102,6 +103,13 @@ def augment(coords: torch.Tensor, struct_mask: torch.Tensor, translation_std: fl
     return ((coords - mu) @ R.transpose(-1, -2) + shift) * m
 
 
+def centered_noise(struct_mask: torch.Tensor) -> torch.Tensor:
+    """(B, L) bool -> (B, L, 3): N(0, I) at real residues, zero mean over them, 0 elsewhere."""
+    m = struct_mask[..., None].float()
+    eps = torch.randn(*struct_mask.shape, 3, device=struct_mask.device) * m
+    return (eps - eps.sum(dim=1, keepdim=True) / m.sum(dim=1, keepdim=True)) * m
+
+
 def corrupt(batch: dict, t: torch.Tensor, t_prime: torch.Tensor):
     """
     It corrupts a single batch using the noise levels t, t_prime for sequence and structure.
@@ -116,14 +124,9 @@ def corrupt(batch: dict, t: torch.Tensor, t_prime: torch.Tensor):
     L = batch["seq"].shape[-1]
     dev = batch["seq"].device
     seq_noise_mask = (torch.rand(B, L, device=dev) < (1 - t)[:, None]) & batch["struct_mask"]
-    seq_t = batch["seq"].masked_fill(seq_noise_mask, 32)
+    seq_t = batch["seq"].masked_fill(seq_noise_mask, MASK_ID)
     x_clean = batch["coords"] / SIGMA_DATA
-    epsilon = torch.randn(B, L, 3, device=dev)
-    # set zero outside the mask
-    m = batch["struct_mask"][..., None].to(epsilon.dtype)  # (B, L, 1): 1 at real
-    epsilon = epsilon * m  # zero padding / <cls> /
-    c = epsilon.sum(dim=1, keepdim=True) / m.sum(dim=1, keepdim=True)  # (B, 1, 3):
-    epsilon = (epsilon - c) * m
+    epsilon = centered_noise(batch["struct_mask"])
     # interpolate
     x_prime = (1 - t_prime)[:, None, None] * epsilon + t_prime[:, None, None] * x_clean
     # get velocity target:
@@ -154,6 +157,15 @@ def structure_rigid_alignment(coords: torch.Tensor, ref_coords: torch.Tensor, ma
     R = U @ D @ Vh  # (B, 3, 3),rotates x onto x_ref
     # coordinates are row vectors: x_aligned = x R^T, then move to the reference centroid
     return (x @ R.transpose(-1, -2) + mu_ref) * m
+
+
+def ca_rmsd(coords: torch.Tensor, ref_coords: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """RMSD after Kabsch alignment of `coords` onto `ref_coords`, per protein: (B, L, 3) x2,
+    mask (B, L) bool -> (B,), in the unit of the inputs."""
+    aligned = structure_rigid_alignment(coords.float(), ref_coords.float(), mask)
+    m = mask.float()
+    se = ((aligned - ref_coords.float()) ** 2).sum(-1) * m
+    return (se.sum(1) / m.sum(1)).sqrt()
 
 
 def aligned_velocity_target(x_clean, eps, coords_t, v_pred, t_prime, struct_mask):

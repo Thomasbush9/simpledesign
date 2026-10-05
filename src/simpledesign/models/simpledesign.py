@@ -12,7 +12,16 @@ import torch.nn.init as init
 from einops import rearrange
 from safetensors.torch import load_file
 
-from simpledesign.models.utils import apply_rope, rope_cos_sin, sinusoidal
+from simpledesign.models.loss import AA_IDS
+from simpledesign.models.utils import (
+    MASK_ID,
+    SIGMA_DATA,
+    apply_rope,
+    centered_noise,
+    random_rotations,
+    rope_cos_sin,
+    sinusoidal,
+)
 
 
 # build the Mixture-of-Transformer (MoT) Trunk
@@ -214,6 +223,7 @@ class MoT(nn.Module):
         )
         # we now concatenate the Q, K and V for both modalities:
         # B, L+L, D
+        # TODO: test diff heads
         joint_Q = rearrange(
             torch.cat((seq_Q, str_Q), dim=1), "b l (h d_k) -> b h l d_k", h=self.num_heads
         )
@@ -502,6 +512,158 @@ class SimpleDesign(nn.Module):
         )
         model.load_esm2(load_file(ckpt_dir / "model.safetensors"))
         return model
+
+    @torch.no_grad()
+    def sample_seq(
+        self,
+        seq_mask: torch.Tensor,
+        struct_mask: torch.Tensor,
+        idx: torch.Tensor,
+        struct: torch.Tensor,
+        t_struct: torch.Tensor,
+        *,
+        gumbel_sigma: float = 0.5,
+        temp_start: float = 0.5,
+        temp_end: float = 0.1,
+        n_steps: int = 200,
+        remask: bool = True,
+        seq_init: torch.Tensor | None = None,
+    ):
+        """Generate sequences for a fixed structure: unmask from t = 0 (all <mask>) to t = 1.
+
+        seq_mask, struct_mask, idx: as in `forward` (e.g. a ProteinCollator batch).
+        struct: (B, L, 3) in nm, centered on the real residues: true coords / SIGMA_DATA
+        (inverse folding, t_struct = 1) or centered_noise(struct_mask) (unconditional,
+        t_struct = 0).
+        t_struct: (B,) float structure noise level, held fixed.
+        Each step proposes a token at every residue, Cat(softmax((logits + gumbel_sigma * g) / T))
+        over the 20 amino acids, g ~ Gumbel(0, 1), T linear from temp_start (t = 0) to temp_end
+        (t = 1), then keeps K = floor(N t_next) residues unmasked, ranked by the log-probability
+        (under that softmax) of the token they would hold:
+        remask=True (paper, DPLM): ranking over all residues; inside the top K, masked residues
+        take their proposal and decoded ones keep their token, every other residue goes back
+        to <mask>, so early tokens can be revised.
+        remask=False: ranking over masked residues only, decoded tokens are final.
+        -> tokens (B, L)
+        """
+        was_training = self.training
+        self.eval()
+        N = struct_mask.sum(1)
+        # fully masked input: <cls> <mask> ... <mask> <eos> <pad> ...
+        # seq_mask & ~struct_mask is exactly <cls> (column 0) and <eos>
+        pad = torch.full_like(idx, 1)
+        seq = torch.where(struct_mask, MASK_ID, torch.where(seq_mask, 2, pad))
+        seq[:, 0] = 0  # <cls>
+
+        ts = torch.linspace(0, 1, n_steps + 1, device=struct_mask.device)
+        for i in range(n_steps):
+            t = ts[i]
+            # the model's sequence time is the observed fraction, as in training (mask p = 1 - t)
+            observed = ((seq != MASK_ID) & struct_mask).sum(1)
+            t_seq = observed / N.clamp(min=1)
+            logits = self(seq, struct, seq_mask, struct_mask, idx, t_seq, t_struct)[0].float()
+            aa = logits[..., AA_IDS]
+            # build the noise level:
+            g = -torch.empty_like(aa).exponential_().log()
+            # add scaled noise
+            aa = aa + gumbel_sigma * g
+            # apply temperature at time t
+            T = temp_start + (temp_end - temp_start) * t
+            aa = aa / T
+            # draw a proposal: choice indexes the 20 amino acids
+            choice = torch.distributions.Categorical(logits=aa).sample()  # B, L
+            proposal = choice + AA_IDS.start  # turn them into token ids
+            logp = aa.log_softmax(-1)
+            masked = (seq == MASK_ID) & struct_mask
+            # token each residue would hold if selected (a): proposal if masked, else its token
+            new = torch.where(masked, proposal, seq) if remask else proposal
+            candidates = struct_mask if remask else masked
+            # its confidence; clamp only touches non-residue slots, dropped by the -inf below
+            new_idx = (new - AA_IDS.start).clamp(0, aa.shape[-1] - 1)
+            confidence = logp.gather(-1, new_idx[..., None]).squeeze(-1)  # B L
+            confidence = confidence.masked_fill(~candidates, -torch.inf)
+            # unmasked residues after the step, floor(N * t_next) in exact integer arithmetic
+            n_unmasked = N * (i + 1) // n_steps
+            k = n_unmasked if remask else n_unmasked - (N - masked.sum(1))
+            # rank within each protein, rank 0 is the most confident
+            rank = confidence.argsort(1, descending=True).argsort(1)
+            selected = (rank < k[:, None]) & candidates
+            if remask:
+                # (b) residues outside the top K go (back) to <mask>
+                seq = torch.where(struct_mask, torch.where(selected, new, MASK_ID), seq)
+            else:
+                seq = torch.where(selected, new, seq)
+
+        self.train(was_training)
+        return seq
+
+    @torch.no_grad()
+    def sample_struct(
+        self,
+        seq: torch.Tensor,
+        seq_mask: torch.Tensor,
+        struct_mask: torch.Tensor,
+        idx: torch.Tensor,
+        *,
+        n_steps: int = 200,
+        sde: bool = True,
+        tau: float = 0.5,
+        eta: float = 0.01,
+        rotate: bool = True,
+        x_init: torch.Tensor | None = None,
+        t_start: float = 0.0,
+        traj_every: int | None = None,
+    ):
+        """Generate structures for a fixed sequence: integrate t' from t_start to 1.
+
+        seq, seq_mask, struct_mask, idx: as in `forward` (e.g. a ProteinCollator batch). The
+        sequence noise level is the observed fraction of residues: real tokens -> t = 1
+        (folding), all <mask> -> t = 0 (unconditional structure).
+        sde=False: Euler ODE, x += v dt.
+        sde=True: Euler-Maruyama on the Langevin-corrected SDE
+            dx = [v + 1/2 w s] dt + sqrt(tau w) dW,   s = (t v - x) / (1 - t),
+            w(t) = 2 (1 - t) / (t + eta)   =>   1/2 w s = (t v - x) / (t + eta),
+        tau: low -> refined structures, 1 -> diverse ones.
+        rotate: random global rotation after every step (the model was trained on random
+        orientations); the structure is always re-centered.
+        x_init: (B, L, 3) Angstrom, centered on the real residues. Start from
+        x_{t_start} = (1 - t_start) eps + t_start x_init / SIGMA_DATA (refinement / editing).
+        -> coords (B, L, 3) in Angstrom, 0 outside struct_mask; with traj_every also the list of
+        intermediate structures (Angstrom) every traj_every steps, start and end included.
+        """
+        was_training = self.training
+        self.eval()
+        B = seq.shape[0]
+        m = struct_mask[..., None].float()
+        observed = ((seq != MASK_ID) & struct_mask).sum(1)
+        t_seq = observed / struct_mask.sum(1).clamp(min=1)
+
+        x = centered_noise(struct_mask)  # x_0 = eps, nm
+        if x_init is not None:
+            x = (1 - t_start) * x + t_start * (x_init / SIGMA_DATA) * m
+        ts = torch.linspace(t_start, 1.0, n_steps + 1, device=x.device)
+        traj = [x * SIGMA_DATA] if traj_every else None
+        for i in range(n_steps):
+            t, dt = ts[i], ts[i + 1] - ts[i]
+            v = self(seq, x, seq_mask, struct_mask, idx, t_seq, t.expand(B))[1].float()
+            if sde:
+                w = 2 * (1 - t) / (t + eta)
+                drift = v + (t * v - x) / (t + eta)
+                x = x + drift * dt + (tau * w * dt).sqrt() * centered_noise(struct_mask)
+            else:
+                x = x + v * dt
+            x = (x - (x * m).sum(dim=1, keepdim=True) / m.sum(dim=1, keepdim=True)) * m
+            if rotate:
+                x = x @ random_rotations(B, x.device).transpose(-1, -2)
+            if traj_every and ((i + 1) % traj_every == 0 or i + 1 == n_steps):
+                traj.append(x * SIGMA_DATA)
+        self.train(was_training)
+        return (x * SIGMA_DATA, traj) if traj_every else x * SIGMA_DATA
+
+    def joint_sample(
+        self,
+    ):
+        pass
 
     def forward(
         self,

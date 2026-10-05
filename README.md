@@ -68,6 +68,24 @@ uv run torchrun --standalone --nproc_per_node=4 scripts/train.py --config <yaml>
   (`ckpt_keep_all: true` keeps `step_XXXXXXX.pt`). Writes are atomic.
 - `resume_from: <ckpt>` restores model, optimizer, step and history, then trains up to `num_steps`.
 
+## Structure sampling
+
+`SimpleDesign.sample_struct(seq, seq_mask, struct_mask, idx, ...)` integrates the structure time
+t' from noise (or from a noised `x_init` at `t_start`) to 1 with the sequence held fixed: Euler ODE
+(`sde=False`) or the Langevin-corrected SDE (`tau`, `eta`, w(t) = 2(1 - t)/(t + eta)), re-centering
+and randomly rotating after every step. Returns Angstrom coordinates (+ trajectory with
+`traj_every`).
+
+```bash
+uv run python scripts/sample.py --ckpt runs/<run>/ckpt/last.pt                # SDE, tau 0.5
+uv run python scripts/sample.py --ckpt ... --ode --ids Q9UI30 --n_samples 16   # no injected noise
+uv run python scripts/sample.py --ckpt ... --t_start 0.7 --traj_every 10       # refine + movie
+```
+
+Folds dataset proteins and writes `<run>/samples/<settings>/`: CA-only PDBs (samples aligned onto
+`true.pdb`, `traj.pdb` with one model per frame), `samples.png`, and `metrics.tsv` (RMSD, RMSD to
+the mirrored truth, CA-CA distances).
+
 ## Layout
 
 ```
