@@ -4,6 +4,7 @@
     uv run python scripts/sample.py --ckpt ... --ids Q9UI30 --n_samples 16 --tau 1.0
     uv run python scripts/sample.py --ckpt ... --ode             # ODE: no noise after x_0
     uv run python scripts/sample.py --ckpt ... --t_start 0.5     # refine from the noised truth
+    uv run python scripts/sample.py --ckpt ... --schedule log    # paper's log-spaced t' grid
 
 Writes to out_dir (default <run>/samples/<settings>):
     <id>/true.pdb, <id>/sample_<k>.pdb   CA-only, samples Kabsch-aligned onto the truth
@@ -62,6 +63,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_proteins", type=int, default=4)
     parser.add_argument("--n_samples", type=int, default=8)
     parser.add_argument("--n_steps", type=int, default=200)
+    parser.add_argument("--schedule", choices=("linear", "log"), default="linear")
     parser.add_argument("--ode", action="store_true", help="Euler ODE instead of the SDE")
     parser.add_argument("--tau", type=float, default=0.5, help="SDE noise scale")
     parser.add_argument("--eta", type=float, default=0.01)
@@ -81,7 +83,8 @@ if __name__ == "__main__":
     collate = ProteinCollator(tokenizer, max_len=None)
 
     method = "ode" if cli.ode else f"sde_tau{cli.tau}"
-    settings = f"{method}_steps{cli.n_steps}" + (f"_t0{cli.t_start}" if cli.t_start > 0 else "")
+    settings = f"{method}_{cli.schedule}_steps{cli.n_steps}"
+    settings += f"_t0{cli.t_start}" if cli.t_start > 0 else ""
     out = Path(cli.out_dir or Path(cli.ckpt).parent.parent / "samples" / settings)
     out.mkdir(parents=True, exist_ok=True)
     (out / "args.json").write_text(json.dumps({**vars(cli), "ckpt_step": step}, indent=2))
@@ -106,6 +109,7 @@ if __name__ == "__main__":
             sm,
             batch["idx"],
             n_steps=cli.n_steps,
+            struct_schedule_type=cli.schedule,
             sde=not cli.ode,
             tau=cli.tau,
             eta=cli.eta,
