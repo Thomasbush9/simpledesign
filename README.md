@@ -68,6 +68,54 @@ uv run torchrun --standalone --nproc_per_node=4 scripts/train.py --config <yaml>
   (`ckpt_keep_all: true` keeps `step_XXXXXXX.pt`). Writes are atomic.
 - `resume_from: <ckpt>` restores model, optimizer, step and history, then trains up to `num_steps`.
 
+`joint_eval_every: N` runs an internal joint-sampling probe every N steps and at the final step
+(`null` disables it). It pauses training while sampling; no independent folding model is loaded.
+`joint_eval_length`, `joint_eval_n_samples`, and `joint_eval_n_steps` set the fixed probe panel.
+`joint_eval_seed` fixes probe randomness; CPU/device RNG states and model mode are restored.
+
+`Trainer.evaluate_joint()` generates sequence/structure pairs, inverse-folds each generated
+structure, and folds each generated sequence from fresh noise. All three samplers use
+`joint_eval_n_steps`; joint generation and folding use the log structure schedule. It returns
+`seq`, `struct`, `inverted_folding_seq`, `folded_structure`, `seq_mask`, `struct_mask`, `idx`, and
+four per-sample metric tensors, computed on the model device:
+
+- `seq_agreement`: residue-token agreement between the joint and inverse-folded sequences.
+- `struct_mse`: mean squared xyz error after the existing Kabsch alignment, in Angstrom².
+- `struct_rmsd`: Cα RMSD after the same alignment, in Angstrom; `RMSD² = 3 × MSE`.
+- `struct_rmsd_mirror`: Cα RMSD after reflecting the refolded structure across one axis and then
+  applying Kabsch alignment to the joint structure, in Angstrom. Saved coordinates are unchanged.
+
+Only real residues contribute. Alignment allows proper rotations/translations, not reflections.
+Both returned structures are in Angstrom; only the inverse-folding input is converted to model
+units. These are same-model consistency diagnostics, not independent validation or native accuracy.
+A low reflected RMSD with high ordinary RMSD indicates relative handedness disagreement, not
+which structure is correct. Both RMSDs appear together in the comparison plot; earlier saved
+evaluations without the reflected metric have no reflected data points.
+
+`Trainer.log_joint_eval()` transfers results to CPU for export/plotting. Training calls it after
+flushing buffered logs. Every evaluation is retained under `out_dir/joint_eval/step_XXXXXXX/`:
+
+```text
+args.json                       # step, training/probe settings, units, metric definitions
+metrics.tsv                     # one row per sample
+samples.pt                      # full-precision CPU tensors, including masks and metrics
+metrics.png                     # metric history: samples, means, and min/max bands
+sample_0000/
+  sequence.fasta                # joint-generated sequence
+  structure.pdb                 # joint-generated Cα structure, original coordinates
+  inverse_folded.fasta          # sequence generated from that structure
+  folded_structure.pdb          # structure generated from sequence.fasta, original coordinates
+```
+
+Sample directories repeat for each generated pair. PDB coordinates have standard text precision;
+`samples.pt` preserves full precision. An evaluation directory is published atomically and never
+overwritten; use a fresh `out_dir` for a new experiment. Curves include earlier saved evaluations
+in the same run, including after resume. With W&B enabled, per-sample means are logged as
+`joint_eval/seq_agreement`, `joint_eval/struct_mse`, `joint_eval/struct_rmsd`, and
+`joint_eval/struct_rmsd_mirror`, plus the figure as `joint_eval/metrics`.
+Saved pairs support later independent checking without rerunning sampling;
+they do not include an additional model checkpoint or a reconstructed full-atom backbone.
+
 ## Sampling
 
 `src/simpledesign/models/sampling.py` holds the shared pieces: `masked_sequence` (start tokens),

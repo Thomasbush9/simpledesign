@@ -233,3 +233,43 @@ def plot_samples(samples, true, rmsd=None, dims=((0, 1), (0, 2), (1, 2)), title=
         fig.suptitle(title)
     fig.tight_layout()
     return fig
+
+
+def plot_joint_history(history):
+    """Per-sample internal consistency metrics vs training step, with means and min/max bands."""
+    panels = (
+        ("seq_agreement", "Inverse-folding sequence agreement", "Matching residue fraction"),
+        ("struct_mse", "Folding aligned MSE", "Coordinate MSE (Å²)"),
+        ("struct_rmsd", "Folding Cα RMSD: aligned vs reflected", "Cα RMSD (Å)"),
+    )
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    for ax, (key, title, ylabel) in zip(axes, panels, strict=True):
+        keys = (key, "struct_rmsd_mirror") if key == "struct_rmsd" else (key,)
+        for j, metric in enumerate(keys):
+            # Older saved evaluations have no reflected RMSD; do not invent past values.
+            rows = [row for row in history if metric in row]
+            if not rows:
+                continue
+            steps = np.array([int(row["step"]) for row in rows])
+            unique_steps = np.unique(steps)
+            values = np.array([float(row[metric]) for row in rows])
+            groups = [values[steps == step] for step in unique_steps]
+            label = "Mean" if len(keys) == 1 else ("Aligned", "Reflected + aligned")[j]
+            color = f"C{j}"
+            ax.scatter(steps, values, s=16, alpha=0.4, color=color)
+            ax.plot(
+                unique_steps, [v.mean() for v in groups], "o-", color=color, label=label
+            )
+            ax.fill_between(
+                unique_steps, [v.min() for v in groups], [v.max() for v in groups],
+                alpha=0.15, color=color,
+            )
+        ax.set_title(title)
+        ax.set_xlabel("Training step")
+        ax.set_ylabel(ylabel)
+        ax.set_ylim(bottom=0, top=1 if key == "seq_agreement" else None)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+    fig.suptitle("Internal joint-sampling consistency — not independent validation")
+    fig.tight_layout()
+    return fig

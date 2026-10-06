@@ -1,6 +1,9 @@
+import csv
+import json
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,17 +17,27 @@ from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 
 from simpledesign.data.dataset import ProteinCollator, ProteinDataset
+from simpledesign.data.parsing import write_ca_structure
 from simpledesign.models.loss import joint_loss, masked_accuracy
 from simpledesign.models.simpledesign import SimpleDesign
 from simpledesign.models.utils import (
+    SIGMA_DATA,
     aligned_velocity_target,
     augment,
+    ca_rmsd,
     corrupt,
     sample_timesteps,
+    structure_rigid_alignment,
 )
-from simpledesign.viz.visualization import plot_history, plot_sequence, plot_velocity
+from simpledesign.viz.visualization import (
+    plot_history,
+    plot_joint_history,
+    plot_sequence,
+    plot_velocity,
+)
 
 SCALARS = ("total", "seq", "struct", "acc", "grad_norm")
+JOINT_METRICS = ("seq_agreement", "struct_mse", "struct_rmsd", "struct_rmsd_mirror")
 
 
 @dataclass
@@ -49,6 +62,12 @@ class TrainerArgs:
     seed: int = 0
     fixed_corruption: bool = False  # overfit check: one batch, one corruption, every step
     translation_std: float = 0.0  # Angstrom, random shift applied after the random rotation
+    # validation args:
+    joint_eval_every: int | None = 5_000  # None: off; otherwise periodic and final step
+    joint_eval_length: int = 89
+    joint_eval_n_samples: int = 2
+    joint_eval_n_steps: int = 200
+    joint_eval_seed: int = 1234
     # logging / outputs (rank 0 only)
     out_dir: str = "runs/debug"
     log_every: int = 100
@@ -290,6 +309,170 @@ class Trainer:
         for fig in figs.values():
             plt.close(fig)
 
+    @torch.no_grad()
+    def evaluate_joint(self) -> dict[str, torch.Tensor]:
+        """Seeded internal round trips and per-sample metrics on the model device.
+
+        Structures/RMSD are in Angstrom; MSE averages squared error over residues and xyz.
+        Sampling preserves training RNG state and model mode, including on MPS.
+        """
+        a = self.args
+        rng_devices = [] if self.device.type == "cpu" else [self.device]
+        was_training = self.model.training
+        with torch.random.fork_rng(devices=rng_devices, device_type=self.device.type):
+            torch.random.default_generator.manual_seed(a.joint_eval_seed)
+            if rng_devices:
+                getattr(torch, self.device.type).manual_seed(a.joint_eval_seed)
+            try:
+                seq, struct = self.model.joint_sample(
+                    [a.joint_eval_length] * a.joint_eval_n_samples,
+                    a.joint_eval_n_steps,
+                    struct_schedule_type="log",
+                )
+                # All samples have the same length: cls, residues, eos, with no padding.
+                idx = torch.arange(seq.shape[1], device=seq.device).expand_as(seq)
+                seq_mask = torch.ones_like(seq, dtype=torch.bool)
+                struct_mask = (idx > 0) & (idx <= a.joint_eval_length)
+                inverted_folding_seq = self.model.sample_seq(
+                    seq_mask=seq_mask,
+                    struct_mask=struct_mask,
+                    idx=idx,
+                    struct=struct / SIGMA_DATA,
+                    t_struct=torch.ones(seq.shape[0], device=seq.device),
+                    n_steps=a.joint_eval_n_steps,
+                )
+                folded_structure = self.model.sample_struct(
+                    seq=seq,
+                    seq_mask=seq_mask,
+                    struct_mask=struct_mask,
+                    idx=idx,
+                    n_steps=a.joint_eval_n_steps,
+                    struct_schedule_type="log",
+                )
+            finally:
+                self.model.train(was_training)
+
+        n_residues = struct_mask.sum(dim=1)
+        matches = seq == inverted_folding_seq
+        agreement = (matches & struct_mask).sum(dim=1) / n_residues
+        # Reuse the loss's Kabsch alignment; proper rotations only, no CPU transfer.
+        aligned = structure_rigid_alignment(folded_structure.float(), struct.float(), struct_mask)
+        squared_error = (aligned - struct.float()).square().sum(dim=-1)
+        mse = (squared_error * struct_mask).sum(dim=1) / (3 * n_residues)
+        # Reflect a copy of the refolded structure, then align; never alter the saved sample.
+        reflected = folded_structure * folded_structure.new_tensor([1.0, 1.0, -1.0])
+        rmsd_mirror = ca_rmsd(reflected, struct, struct_mask)
+
+        return {
+            "seq": seq,
+            "struct": struct,
+            "inverted_folding_seq": inverted_folding_seq,
+            "folded_structure": folded_structure,
+            "seq_mask": seq_mask,
+            "struct_mask": struct_mask,
+            "idx": idx,
+            "seq_agreement": agreement,
+            "struct_mse": mse,
+            "struct_rmsd": (3 * mse).sqrt(),
+            "struct_rmsd_mirror": rmsd_mirror,
+        }
+
+    def log_joint_eval(self, result: dict[str, torch.Tensor]) -> None:
+        """Save immutable step-numbered samples, per-sample metrics, and learning curves."""
+        root = Path(self.args.out_dir) / "joint_eval"
+        root.mkdir(parents=True, exist_ok=True)
+        out = root / f"step_{self.step:07d}"
+        if out.exists():
+            raise FileExistsError(f"evaluation already exists: {out}; use a new out_dir")
+        # Metrics stay on-device until this reporting boundary; transfer each tensor once.
+        cpu = {k: v.detach().cpu() for k, v in result.items()}
+        rows = [
+            {
+                "step": self.step,
+                "sample": f"sample_{i:04d}",
+                "length": int(cpu["struct_mask"][i].sum()),
+                **{key: float(cpu[key][i]) for key in JOINT_METRICS},
+            }
+            for i in range(len(cpu["seq"]))
+        ]
+        # Rebuild from saved evaluations so curves also include evaluations before a resume.
+        history = []
+        for path in sorted(root.glob("step_*/metrics.tsv")):
+            with path.open(newline="") as f:
+                history.extend(
+                    r for r in csv.DictReader(f, delimiter="\t") if int(r["step"]) < self.step
+                )
+        fig = plot_joint_history(history + rows)
+        try:
+            # Publish a complete sample set atomically; never replace an earlier evaluation.
+            with TemporaryDirectory(prefix=".joint_eval_", dir=root) as temp:
+                stage = Path(temp) / out.name
+                stage.mkdir()
+                metadata = {
+                    "step": self.step,
+                    "args": asdict(self.args),
+                    "structure_units": "Angstrom",
+                    "structure_representation": "CA-only",
+                    "struct_schedule_type": "log",
+                    "evaluation": "SimpleDesign internal conditional round trips",
+                    "metrics": {
+                        "seq_agreement": "matching residue token fraction",
+                        "struct_mse": "Kabsch-aligned mean squared xyz error (Angstrom^2)",
+                        "struct_rmsd": "Kabsch-aligned CA RMSD (Angstrom)",
+                        "struct_rmsd_mirror": "CA RMSD after reflection then Kabsch (Angstrom)",
+                    },
+                }
+                (stage / "args.json").write_text(json.dumps(metadata, indent=2) + "\n")
+                torch.save(cpu, stage / "samples.pt")
+                with (stage / "metrics.tsv").open("w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=list(rows[0]), delimiter="\t")
+                    writer.writeheader()
+                    writer.writerows(rows)
+                for i, row in enumerate(rows):
+                    sample = stage / row["sample"]
+                    sample.mkdir()
+                    mask = cpu["struct_mask"][i]
+                    seq = "".join(
+                        self.tokenizer.convert_ids_to_tokens(cpu["seq"][i, mask].tolist())
+                    )
+                    inverse = "".join(
+                        self.tokenizer.convert_ids_to_tokens(
+                            cpu["inverted_folding_seq"][i, mask].tolist()
+                        )
+                    )
+                    (sample / "sequence.fasta").write_text(f">{row['sample']}\n{seq}\n")
+                    (sample / "inverse_folded.fasta").write_text(
+                        f">{row['sample']}_inverse_folded\n{inverse}\n"
+                    )
+                    # Preserve original coordinates, not aligned copies, for independent checking.
+                    write_ca_structure(
+                        sample / "structure.pdb", seq, cpu["struct"][i, mask].numpy()
+                    )
+                    write_ca_structure(
+                        sample / "folded_structure.pdb",
+                        seq,
+                        cpu["folded_structure"][i, mask].numpy(),
+                    )
+                fig.savefig(stage / "metrics.png", dpi=130)
+                stage.rename(out)
+            means = {key: float(np.mean([r[key] for r in rows])) for key in JOINT_METRICS}
+            print(
+                f"joint eval {self.step:6d} | agreement {means['seq_agreement']:.3f} "
+                f"| MSE {means['struct_mse']:.3f} A^2 | RMSD {means['struct_rmsd']:.3f} A"
+                f" | reflected RMSD {means['struct_rmsd_mirror']:.3f} A"
+            )
+            print(f"wrote {out}")
+            if self.args.use_wandb:
+                wandb.log(
+                    {
+                        **{f"joint_eval/{k}": v for k, v in means.items()},
+                        "joint_eval/metrics": wandb.Image(fig),
+                    },
+                    step=self.step,
+                )
+        finally:
+            plt.close(fig)
+
     def train(self) -> SimpleDesign:
         a = self.args
         if self.is_main:
@@ -319,16 +502,21 @@ class Trainer:
                 continue
             buffer.append((self.step, stats))
             last = self.step == a.num_steps
+            joint_eval = a.joint_eval_every is not None and (
+                self.step % a.joint_eval_every == 0 or last
+            )
             save = a.ckpt_dir is not None and (self.step % a.ckpt_every == 0 or last)
             plot = a.plot_every is not None and (self.step % a.plot_every == 0 or last)
-            # flush before saving/plotting: wandb drops rows logged at a step below the current one
-            if self.step % a.log_every == 0 or save or plot or last:
+            # Flush before reporting: wandb drops rows logged below the current step.
+            if self.step % a.log_every == 0 or save or plot or joint_eval or last:
                 self.log(buffer)
                 buffer = []
             if save:
                 self.save()
             if plot:
                 self.plot()
+            if joint_eval:
+                self.log_joint_eval(self.evaluate_joint())
 
         if self.is_main:
             if a.plot_history and self.history:
