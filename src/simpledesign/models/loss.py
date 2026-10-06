@@ -1,4 +1,6 @@
+import torch
 import torch.nn.functional as F
+from simpledesign.models.utils import make_frames
 
 AA_IDS = slice(4, 24)
 
@@ -42,3 +44,56 @@ def joint_loss(
 def masked_accuracy(logits, seq, noise_mask):
     pred = logits[..., AA_IDS].argmax(-1) + AA_IDS.start
     return (pred == seq)[noise_mask].float().mean()
+
+
+# FAPE loss if needed:
+
+
+def fape(
+    x_pred: torch.Tensor,
+    R_pred: torch.Tensor,
+    p_pred: torch.Tensor,
+    x_true: torch.Tensor,
+    R_true: torch.Tensor,
+    p_true: torch.Tensor,
+    Z=10.0,
+    D_c=10.0,
+    eps=1e-8,
+):
+    """
+    Computes the Frame-Aligned Point Error (FAPE) loss.
+
+    Args:
+        x_pred: [N, 3] Predicted frame translations (e.g., Ca positions)
+        R_pred: [N, 3, 3] Predicted frame rotation matrices
+        p_pred: [N, 3] Predicted atom positions to evaluate (can be same as x_pred)
+
+        x_true: [N, 3] Ground-truth frame translations
+        R_true: [N, 3, 3] Ground-truth frame rotation matrices
+        p_true: [N, 3] Ground-truth atom positions to evaluate
+
+        Z: Clamping threshold (Angstroms)
+        D_c: Normalizing scale factor (Angstroms)
+    """
+    # 1. Project predicted points into predicted local frames
+    # Equation: R^T * (p - x)
+    # [N, 1, 3] - [1, N, 3] -> [N, N, 3] (rel_pos[i, j] is vector from frame i to point j)
+    rel_p_pred = p_pred.unsqueeze(0) - x_pred.unsqueeze(1)
+    # Rotate using predicted R (transpose of R is its inverse)
+    # [N, N, 3] @ [N, 3, 3] -> [N, N, 3]
+    d_pred = torch.einsum("nij,nki->nki", R_pred, rel_p_pred)
+
+    # 2. Project true points into true local frames
+    rel_p_true = p_true.unsqueeze(0) - x_true.unsqueeze(1)
+    d_true = torch.einsum("nij,nki->nki", R_true, rel_p_true)
+
+    # 3. Compute Euclidean distance between local positions
+    # Added eps for numerical stability during backpropagationsqrt
+    dist = torch.sqrt(torch.sum((d_pred - d_true) ** 2, dim=-1) + eps)
+
+    # 4. Clamp the loss at threshold Z
+    clamped_dist = torch.clamp(dist, max=Z)
+
+    # 5. Average and normalize
+    fape = torch.mean(clamped_dist) / D_c
+    return fape
