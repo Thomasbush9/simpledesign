@@ -45,6 +45,29 @@ Batches carry `seq`, `coords`, `seq_mask`, `struct_mask`, `idx` for `SimpleDesig
 `ProteinDataset(..., cache=True)` parses each protein once; `ProteinCollator(tok, max_len=256)`
 randomly crops longer proteins.
 
+### Standalone AFDB subset
+
+```bash
+uv run python scripts/sample_afdb.py --tar /path/to/swissprot.tar --n 100 --min-plddt 90 --seed 0 --out data/subset
+uv run python scripts/sample_afdb.py --log data/subset/selection.json --out data/replayed
+```
+
+Samples uniformly without replacement from `.cif` / `.cif.gz` members whose mean Cα
+pLDDT is at least the threshold (0–100; default 90). The initial pass scans the entire
+archive; fewer than N eligible structures is an error. PDB copies are ignored.
+Writes paired structures/FASTA, `summary.tsv`, and a JSON selection log, then loads
+and validates a cached `ProteinDataset`; `sample_afdb(...)` returns that dataset.
+Output directories must be new.
+
+`--log` defaults to `<out>/selection.json`: a new path saves the selection; an existing
+log replays exactly those members, ignoring N, threshold, and seed. The log records the
+archive path, size/mtime, member offsets, hashes, and scores. Replay checks the archive
+and member hashes and does not resample or overwrite the log. Plain tar replay seeks
+directly to selected members; outer-compressed tar still requires decompression.
+
+This script is not connected to training. Full SwissProt validation and user approval
+are required before training-loop integration; `../info.md` currently omits the archive path.
+
 ## Training
 
 Every key in `configs/train_config.yaml` is a `TrainerArgs` field
