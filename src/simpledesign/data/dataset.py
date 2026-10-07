@@ -181,5 +181,5 @@ class ProteinCollator:
             "struct_mask": struct_mask,
             "coords": coords,
             "b_factor": b_factor,
-            "idx": torch.arange(L).expand(B, L),
+            "idx": torch.arange(L).expand(B, L).contiguous(),
         }

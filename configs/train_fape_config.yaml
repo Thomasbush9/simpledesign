@@ -1,0 +1,49 @@
+# Fresh 100-protein overfit experiment; baseline outputs remain in runs/mps-20k.
+# Same ESM2 initialization/seed, beta-FAPE added, replicas increased from 4 to 16.
+esm_ck: checkpoints/esm2_t6_8M_UR50D
+sigma: 1.0
+
+# Replay the exact baseline subset; do not resample.
+data_dir: data/afdb_100
+afdb_tar: null
+afdb_log: data/afdb_100/selection.json
+afdb_n: 100
+afdb_min_plddt: 80.0
+afdb_seed: 0
+max_len: 256
+batch_size: 4
+n_replicas: 16       # independent rotations/noise; effective batch = 64 views
+num_workers: 0
+cache: true
+
+num_steps: 50000
+lr: 1.0e-4
+weight_decay: 0.01
+grad_clip: 1.0
+lambda_seq: 1.0
+lambda_struct: 1.0
+beta_fape: 1.0      # CA-frame FAPE; clamp and normalization are both 1 nm
+seed: 0
+fixed_corruption: false
+translation_std: 0.0
+
+joint_eval_every: null
+joint_eval_length: 89
+joint_eval_n_samples: 2
+joint_eval_n_steps: 200
+joint_eval_seed: 1234
+
+out_dir: runs/afdb100-fape1-r16-50k
+log_every: 1000
+plot_history: true
+plot_smooth: 20
+plot_every: 1000
+viz_levels: [0.25, 0.5, 0.75]
+use_wandb: true
+wandb_project: simpledesign
+wandb_name: afdb100-fape1-r16-50k
+
+ckpt_dir: runs/afdb100-fape1-r16-50k/ckpt
+ckpt_every: 1000
+ckpt_keep_all: false
+resume_from: null

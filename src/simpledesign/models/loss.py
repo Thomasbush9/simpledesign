@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-from simpledesign.models.utils import make_frames
 
 AA_IDS = slice(4, 24)
 
@@ -12,14 +11,22 @@ def joint_loss(
     v_pred,  # (B, L, 3) predicted velocity (nm)
     v_true,  # (B, L, 3) target velocity x1 - x0 (nm)
     struct_mask,  # (B, L) bool, real residues
-    t,  # (B,) sequence noise level; beta(t) = t downweights heavily masked sequences
+    t,  # (B,) sequence noise level; sequence weight t downweights heavily masked sequences
     lambda_seq=1.0,
     lambda_struct=1.0,
     aa_only=True,  # restrict the softmax to the 20 amino acids
+    *,
+    beta_fape=0.0,
+    x_pred=None,  # (B, L, 3) predicted clean CA coordinates (nm)
+    x_true=None,  # (B, L, 3) clean target CA coordinates (nm)
 ):
-    """lambda_seq * L_CE + lambda_struct * L_MSE. Returns (total, {"seq", "struct"}
-    detached)."""
-    # --- sequence: beta(t) * mean CE over masked tokens, per protein, then batch mean
+    """Return weighted CE + velocity MSE + CA FAPE and detached component scalars."""
+    if beta_fape < 0:
+        raise ValueError("beta_fape must be nonnegative")
+    if beta_fape > 0 and (x_pred is None or x_true is None):
+        raise ValueError("x_pred and x_true are required when beta_fape > 0")
+
+    # --- sequence: t * mean CE over masked tokens, per protein, then batch mean
     target = seq
     if aa_only:
         # slice instead of -inf filling the other 13 logits: same softmax, no (B, L, 33) copy;
@@ -37,8 +44,11 @@ def joint_loss(
     se = ((v_pred.float() - v_true.float()) ** 2).sum(-1)  # (B,L)
     struct_obj = ((se * struct_mask).sum(1) / struct_mask.sum(1).clamp(min=1)).mean()
 
-    total = lambda_seq * seq_obj + lambda_struct * struct_obj
-    return total, {"seq": seq_obj.detach(), "struct": struct_obj.detach()}
+    fape_obj = fape(x_pred, x_true, struct_mask) if beta_fape > 0 else struct_obj.new_zeros(())
+    total = lambda_seq * seq_obj + lambda_struct * struct_obj + beta_fape * fape_obj
+    return total, {
+        "seq": seq_obj.detach(), "struct": struct_obj.detach(), "fape": fape_obj.detach()
+    }
 
 
 def masked_accuracy(logits, seq, noise_mask):
@@ -46,54 +56,71 @@ def masked_accuracy(logits, seq, noise_mask):
     return (pred == seq)[noise_mask].float().mean()
 
 
-# FAPE loss if needed:
-
-
 def fape(
     x_pred: torch.Tensor,
-    R_pred: torch.Tensor,
-    p_pred: torch.Tensor,
     x_true: torch.Tensor,
-    R_true: torch.Tensor,
-    p_true: torch.Tensor,
-    Z=10.0,
-    D_c=10.0,
-    eps=1e-8,
-):
+    struct_mask: torch.Tensor,
+    *,
+    clamp_distance: float = 1.0,
+    length_scale: float = 1.0,
+) -> torch.Tensor:
+    """CA frame-aligned point error in nm, averaged per protein then across the batch.
+
+    Inputs are (B, L, 3) coordinates and a (B, L) residue mask. Each consecutive
+    triple defines a right-handed frame centered on its middle CA. Frames crossing
+    masked residues or degenerate in the target are excluded; degenerate predicted
+    frames remain in the loss. Every valid CA is compared in every valid frame.
+    Proteins with no valid frames contribute differentiable zero to the batch mean.
+
+    Independent proper rigid motions leave the loss unchanged; reflections do not.
+    Distances are capped at clamp_distance and divided by length_scale (both nm).
     """
-    Computes the Frame-Aligned Point Error (FAPE) loss.
+    if clamp_distance <= 0 or length_scale <= 0:
+        raise ValueError("clamp_distance and length_scale must be positive")
 
-    Args:
-        x_pred: [N, 3] Predicted frame translations (e.g., Ca positions)
-        R_pred: [N, 3, 3] Predicted frame rotation matrices
-        p_pred: [N, 3] Predicted atom positions to evaluate (can be same as x_pred)
+    with torch.autocast(device_type=x_pred.device.type, enabled=False):
+        # Sanitize padding before frame construction/projection: even NaN padding
+        # must neither contaminate valid points nor their backward gradients.
+        pred = x_pred.float().masked_fill(~struct_mask[..., None], 0.0)
+        true = x_true.float().masked_fill(~struct_mask[..., None], 0.0)
+        if pred.shape[1] < 3:
+            return pred.sum() * 0.0
 
-        x_true: [N, 3] Ground-truth frame translations
-        R_true: [N, 3, 3] Ground-truth frame rotation matrices
-        p_true: [N, 3] Ground-truth atom positions to evaluate
+        eps = 1e-4  # nm; finite derivatives even for collapsed predicted frames
 
-        Z: Clamping threshold (Angstroms)
-        D_c: Normalizing scale factor (Angstroms)
-    """
-    # 1. Project predicted points into predicted local frames
-    # Equation: R^T * (p - x)
-    # [N, 1, 3] - [1, N, 3] -> [N, N, 3] (rel_pos[i, j] is vector from frame i to point j)
-    rel_p_pred = p_pred.unsqueeze(0) - x_pred.unsqueeze(1)
-    # Rotate using predicted R (transpose of R is its inverse)
-    # [N, N, 3] @ [N, 3, 3] -> [N, N, 3]
-    d_pred = torch.einsum("nij,nki->nki", R_pred, rel_p_pred)
+        def frames(coords):
+            origin = coords[:, 1:-1]
+            first = coords[:, :-2] - origin
+            second = coords[:, 2:] - origin
+            first_norm = torch.linalg.vector_norm(first, dim=-1, keepdim=True)
+            e1 = first / first_norm.clamp_min(eps)
+            normal = torch.cross(e1, second, dim=-1)
+            normal_norm = torch.linalg.vector_norm(normal, dim=-1, keepdim=True)
+            e3 = normal / normal_norm.clamp_min(eps)
+            e2 = torch.cross(e3, e1, dim=-1)
+            rotation = torch.stack((e1, e2, e3), dim=-1)
+            return rotation, origin, first_norm[..., 0], normal_norm[..., 0]
 
-    # 2. Project true points into true local frames
-    rel_p_true = p_true.unsqueeze(0) - x_true.unsqueeze(1)
-    d_true = torch.einsum("nij,nki->nki", R_true, rel_p_true)
+        pred_frames, pred_origins, _, _ = frames(pred)
+        true_frames, true_origins, first_norm, normal_norm = frames(true)
+        target_valid = (first_norm >= eps) & (normal_norm >= eps)
+        frame_mask = struct_mask[:, :-2] & struct_mask[:, 1:-1] & struct_mask[:, 2:]
+        frame_mask = frame_mask & target_valid
 
-    # 3. Compute Euclidean distance between local positions
-    # Added eps for numerical stability during backpropagationsqrt
-    dist = torch.sqrt(torch.sum((d_pred - d_true) ** 2, dim=-1) + eps)
-
-    # 4. Clamp the loss at threshold Z
-    clamped_dist = torch.clamp(dist, max=Z)
-
-    # 5. Average and normalize
-    fape = torch.mean(clamped_dist) / D_c
-    return fape
+        # Frame axes are columns: local_j = sum_i R_ij * (point_i - origin_i).
+        # Project points/origins separately to avoid a second (B, F, L, 3)
+        # displacement tensor for each structure.
+        pred_local = torch.einsum("bfij,bpi->bfpj", pred_frames, pred)
+        pred_local = pred_local - torch.einsum(
+            "bfij,bfi->bfj", pred_frames, pred_origins
+        )[:, :, None]
+        true_local = torch.einsum("bfij,bpi->bfpj", true_frames, true)
+        true_local = true_local - torch.einsum(
+            "bfij,bfi->bfj", true_frames, true_origins
+        )[:, :, None]
+        error = torch.linalg.vector_norm(pred_local - true_local, dim=-1)
+        error = error.clamp_max(clamp_distance) / length_scale
+        error = error.masked_fill(~frame_mask[:, :, None], 0.0)
+        error = error.masked_fill(~struct_mask[:, None, :], 0.0)
+        pair_count = frame_mask.sum(1) * struct_mask.sum(1)
+        return (error.sum(dim=(1, 2)) / pair_count.clamp_min(1)).mean()

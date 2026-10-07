@@ -13,7 +13,7 @@ ESM2_AAS = "LAGVSERTIDPKQNFYMHWC"  # ESM2 token ids 4..23 (AA_IDS)
 def plot_history(history, smooth=1, t_bins=(0.0, 0.3, 0.7, 1.0)):
     """Plot a training `history` (list of dicts from the training loop).
 
-    Row 1: sequence CE, structure MSE (log scale), masked-residue accuracy, grad norm.
+    Row 1: sequence CE, structure MSE (log scale), accuracy, grad norm, and active CA-FAPE.
     Row 2 (only if the noise levels vary between steps, i.e. stage 2): per-step losses binned by
     the batch-mean t (sequence) and t' (structure), showing where the model still struggles.
     smooth: moving-average window in steps (1 = raw).
@@ -21,7 +21,7 @@ def plot_history(history, smooth=1, t_bins=(0.0, 0.3, 0.7, 1.0)):
     steps = np.array([h["step"] for h in history])
 
     def series(key):
-        y = np.array([h[key] for h in history], dtype=float)
+        y = np.array([h.get(key, float("nan")) for h in history], dtype=float)
         if smooth > 1 and len(y) >= smooth:
             y = np.convolve(y, np.ones(smooth) / smooth, mode="valid")
             return steps[smooth - 1 :], y
@@ -31,15 +31,19 @@ def plot_history(history, smooth=1, t_bins=(0.0, 0.3, 0.7, 1.0)):
     tp_mean = np.array([np.mean(h["t_prime"]) for h in history])
     varying = np.ptp(tp_mean) > 0 or np.ptp(t_mean) > 0
 
-    fig, axes = plt.subplots(
-        2 if varying else 1, 4, figsize=(18, 7.5 if varying else 3.8), squeeze=False
-    )
     panels = [
         ("seq", "sequence CE (masked)", True),
         ("struct", "structure MSE (nm²)", True),
         ("acc", "masked-residue accuracy", False),
         ("grad_norm", "grad norm (pre-clip)", True),
     ]
+    has_fape = any(h.get("fape", 0.0) > 0 for h in history)
+    if has_fape:
+        panels.append(("fape", "CA-frame FAPE (normalized)", True))
+    fig, axes = plt.subplots(
+        2 if varying else 1, len(panels),
+        figsize=(4.5 * len(panels), 7.5 if varying else 3.8), squeeze=False
+    )
     for ax, (key, title, log) in zip(axes[0], panels):
         x, y = series(key)
         ax.plot(x, y, lw=1.2)
@@ -82,6 +86,15 @@ def plot_history(history, smooth=1, t_bins=(0.0, 0.3, 0.7, 1.0)):
             ax.set_yscale("log")
             ax.set_title(f"{key} loss vs {name} (second half of training)")
             ax.set_xlabel(f"batch-mean {name}  (1 = clean)")
+            ax.grid(alpha=0.3)
+        if has_fape:
+            ax = axes[1][4]
+            last = slice(len(history) // 2, None)
+            values = np.array([h.get("fape", float("nan")) for h in history])
+            ax.scatter(tp_mean[last], values[last], s=8, alpha=0.6)
+            ax.set_yscale("log")
+            ax.set_title("CA-frame FAPE vs t' (second half)")
+            ax.set_xlabel("batch-mean t' (1 = clean)")
             ax.grid(alpha=0.3)
 
     fig.tight_layout()

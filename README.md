@@ -42,22 +42,26 @@ loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=ProteinCollator(t
 
 Each item's structure sequence must equal its FASTA sequence (and `length` in `summary.tsv`).
 Batches carry `seq`, `coords`, `seq_mask`, `struct_mask`, `idx` for `SimpleDesign.forward`.
+The collator materializes batch indices so CUDA DataLoader pinned-memory transfers do not
+encounter overlapping storage from expanded tensor views.
 `ProteinDataset(..., cache=True)` parses each protein once; `ProteinCollator(tok, max_len=256)`
 randomly crops longer proteins.
 
-### Standalone AFDB subset
+### AFDB subsets
 
 ```bash
 uv run python scripts/sample_afdb.py --tar /path/to/swissprot.tar --n 100 --min-plddt 90 --seed 0 --out data/subset
 uv run python scripts/sample_afdb.py --log data/subset/selection.json --out data/replayed
 ```
 
-Samples uniformly without replacement from `.cif` / `.cif.gz` members whose mean Cα
-pLDDT is at least the threshold (0–100; default 90). The initial pass scans the entire
-archive; fewer than N eligible structures is an error. PDB copies are ignored.
+Samples uniformly without replacement from `.cif`, `.pdb`, or their `.gz` members whose
+mean Cα pLDDT is at least the threshold (0–100; default 90). The initial pass scans the
+entire archive; fewer than N eligible structures is an error. Repeated IDs, including
+CIF/PDB copies, use the first representation encountered and count only once.
 Writes paired structures/FASTA, `summary.tsv`, and a JSON selection log, then loads
-and validates a cached `ProteinDataset`; `sample_afdb(...)` returns that dataset.
-Output directories must be new.
+and validates a `ProteinDataset`; `simpledesign.data.afdb.sample_afdb(...)` returns that
+dataset. Existing output is reused only with a selection log and matching protein IDs,
+structure contents, and valid structure/FASTA pairs; conflicting output is never overwritten.
 
 `--log` defaults to `<out>/selection.json`: a new path saves the selection; an existing
 log replays exactly those members, ignoring N, threshold, and seed. The log records the
@@ -65,8 +69,30 @@ archive path, size/mtime, member offsets, hashes, and scores. Replay checks the 
 and member hashes and does not resample or overwrite the log. Plain tar replay seeks
 directly to selected members; outer-compressed tar still requires decompression.
 
-This script is not connected to training. Full SwissProt validation and user approval
-are required before training-loop integration; `../info.md` currently omits the archive path.
+Training uses the same sampler through `configs/train_config.yaml`:
+
+```yaml
+data_dir: data/afdb_100
+afdb_tar: /path/to/swissprot.tar
+afdb_log: null
+afdb_n: 100
+afdb_min_plddt: 90.0
+afdb_seed: 0
+```
+
+Set either `afdb_tar` or `afdb_log` to enable preparation before model initialization.
+`data_dir` is the export directory; `cache` also applies to sampled data. With an existing
+`afdb_log`, the tar path can be null (read from the log), and sampling parameters are ignored.
+The default log is `data_dir/selection.json`, so rerunning/resuming the same configuration
+reuses the same subset. To sample a different subset, choose a new data directory and log.
+With both AFDB paths null, training loads `data_dir` directly as before.
+
+Under DDP, rank 0 prepares the subset and communicates completion/errors before other ranks
+load it; the data directory and log must be on shared storage. For a large initial archive
+scan, prepare the subset with the standalone CLI before launching DDP to avoid process-group
+timeouts while other ranks wait.
+
+The checked-in config samples N=100 at mean pLDDT ≥ 80 from the SwissProt PDB v6 tar.
 
 ## Training
 
@@ -77,6 +103,20 @@ Every key in `configs/train_config.yaml` is a `TrainerArgs` field
 uv run python scripts/train.py --config configs/train_config.yaml                  # cuda > mps > cpu
 uv run torchrun --standalone --nproc_per_node=4 scripts/train.py --config <yaml>  # DDP, one node
 ```
+
+Single H100 on the Kempner partition (submit from the project root):
+
+```bash
+mkdir -p runs/slurm
+sbatch scripts/train_single_gpu.sbatch configs/train_config.yaml
+```
+
+The launcher uses `.venv`, requests one GPU, 8 CPUs, 64 GiB RAM, and 24 hours, and forces
+online W&B logging. Configure credentials with `.venv/bin/wandb login` if not already
+authenticated, or provide `WANDB_API_KEY` through the environment (never in YAML).
+It preserves the config's output/checkpoint paths and W&B project/name.
+Slurm output is `runs/slurm/train-<jobid>.log`; GPU/data preparation precedes W&B run
+initialization, so the dashboard run appears only after the subset and model are ready.
 
 - Each protein is repeated `n_replicas` times; every replica gets its own random rotation
   (+ `translation_std` shift), `t`, `t'`, sequence mask and noise. Rank `r` seeds with `seed + r`.
@@ -90,6 +130,32 @@ uv run torchrun --standalone --nproc_per_node=4 scripts/train.py --config <yaml>
 - `ckpt_dir` set: checkpoint every `ckpt_every` steps and at the end, overwriting `last.pt`
   (`ckpt_keep_all: true` keeps `step_XXXXXXX.pt`). Writes are atomic.
 - `resume_from: <ckpt>` restores model, optimizer, step and history, then trains up to `num_steps`.
+
+### Optional CA-frame FAPE
+
+`beta_fape` (default `0.0`, disabled) adds a reflection-sensitive auxiliary term:
+`total = lambda_seq * sequence_loss + lambda_struct * velocity_loss + beta_fape * FAPE`.
+It compares the predicted clean coordinates `x_hat = x_t + (1 - t') * v_pred` with the
+clean target. This is **CA-frame FAPE**, not full-backbone N/CA/C FAPE: each consecutive
+CA triple defines a right-handed frame, and every valid CA is compared in every valid frame.
+Distances are clamped at 1 nm and normalized by 1 nm, averaged per protein then per batch.
+The term is invariant to independent proper rigid motions but penalizes nonplanar reflections.
+Masked/degenerate target frames are excluded; proteins without valid frames contribute zero.
+Degenerate predicted frames remain penalized. Geometry is computed in float32, outside autocast.
+
+`fape` is logged separately to history, console, and W&B; positive FAPE histories receive an
+additional plot panel. `configs/train_fape_config.yaml` configures a fresh 50,000-step run on
+the same logged 100-protein subset, with `beta_fape: 1.0`, 4 proteins × 16 independently
+augmented replicas = 64 views/step, and separate outputs under `runs/afdb100-fape1-r16-50k`.
+The baseline used 4 replicas, so this comparison changes both FAPE and replica count; it does
+not isolate FAPE's causal effect. Neither CA-only FAPE nor same-model diagnostics establish
+full stereochemical validity.
+
+```bash
+sbatch scripts/train_single_gpu.sbatch configs/train_fape_config.yaml
+```
+
+### Internal joint-sampling diagnostics
 
 `joint_eval_every: N` runs an internal joint-sampling probe every N steps and at the final step
 (`null` disables it). It pauses training while sampling; no independent folding model is loaded.

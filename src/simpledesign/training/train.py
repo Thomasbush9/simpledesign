@@ -16,6 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 
+from simpledesign.data.afdb import sample_afdb
 from simpledesign.data.dataset import ProteinCollator, ProteinDataset
 from simpledesign.data.parsing import write_ca_structure
 from simpledesign.models.loss import joint_loss, masked_accuracy
@@ -36,7 +37,7 @@ from simpledesign.viz.visualization import (
     plot_velocity,
 )
 
-SCALARS = ("total", "seq", "struct", "acc", "grad_norm")
+SCALARS = ("total", "seq", "struct", "fape", "acc", "grad_norm")
 JOINT_METRICS = ("seq_agreement", "struct_mse", "struct_rmsd", "struct_rmsd_mirror")
 
 
@@ -47,6 +48,11 @@ class TrainerArgs:
     sigma: float
     # data
     data_dir: str
+    afdb_tar: str | None = None  # either tar or log enables AFDB preparation
+    afdb_log: str | None = None  # existing: replay; new: save; None: data_dir/selection.json
+    afdb_n: int = 100
+    afdb_min_plddt: float = 90.0
+    afdb_seed: int = 0  # independent of per-rank training randomness
     max_len: int | None = 256  # random contiguous crop (residues); None: no crop
     batch_size: int = 4  # proteins per GPU
     n_replicas: int = 1  # views per protein; the model sees batch_size * n_replicas
@@ -59,6 +65,7 @@ class TrainerArgs:
     grad_clip: float = 1.0
     lambda_seq: float = 1.0
     lambda_struct: float = 1.0
+    beta_fape: float = 0.0  # normalized CA-frame FAPE of the predicted clean structure
     seed: int = 0
     fixed_corruption: bool = False  # overfit check: one batch, one corruption, every step
     translation_std: float = 0.0  # Angstrom, random shift applied after the random rotation
@@ -97,6 +104,8 @@ class Trainer:
         self.world_size = dist.get_world_size() if self.ddp else 1
         self.is_main = self.rank == 0
 
+        ds = self._load_dataset()
+
         torch.manual_seed(args.seed)  # same init on every rank
         self.model = SimpleDesign.from_esm2(args.esm_ck, sigma=args.sigma).to(self.device)
         self.optimizer = torch.optim.AdamW(
@@ -117,7 +126,6 @@ class Trainer:
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(args.esm_ck)
-        ds = ProteinDataset(args.data_dir, cache=args.cache)
         self.sampler = DistributedSampler(ds, seed=args.seed, drop_last=True) if self.ddp else None
         self.loader = DataLoader(
             ds,
@@ -133,6 +141,29 @@ class Trainer:
         assert len(self.loader) > 0, (
             f"{len(ds)} proteins < batch_size {args.batch_size} x {self.world_size} ranks"
         )
+
+    def _load_dataset(self) -> ProteinDataset:
+        a = self.args
+        if a.afdb_tar is None and a.afdb_log is None:
+            return ProteinDataset(a.data_dir, cache=a.cache)
+        ds = None
+        status = [None]
+        if self.is_main:
+            try:
+                ds = sample_afdb(
+                    a.afdb_tar, a.data_dir, a.afdb_n, a.afdb_min_plddt,
+                    a.afdb_seed, a.afdb_log, cache=a.cache,
+                )
+            except Exception as error:
+                if not self.ddp:
+                    raise
+                status[0] = f"{type(error).__name__}: {error}"
+        if self.ddp:
+            # All ranks observe preparation failures instead of training on partial output.
+            dist.broadcast_object_list(status, src=0)
+        if status[0] is not None:
+            raise RuntimeError(f"AFDB preparation failed on rank 0: {status[0]}")
+        return ds if ds is not None else ProteinDataset(a.data_dir, cache=a.cache)
 
     def batches(self):
         """Endless stream of device batches; every epoch reshuffles."""
@@ -190,6 +221,12 @@ class Trainer:
             v["t"],
             lambda_seq=self.args.lambda_seq,
             lambda_struct=self.args.lambda_struct,
+            beta_fape=self.args.beta_fape,
+            x_pred=(
+                v["coords_t"] + (1 - v["t_prime"])[:, None, None] * velocity
+                if self.args.beta_fape > 0 else None
+            ),
+            x_true=v["x_clean"] if self.args.beta_fape > 0 else None,
         )
         self.optimizer.zero_grad(set_to_none=True)
         total.backward()
@@ -199,6 +236,7 @@ class Trainer:
             "total": total.detach(),
             "seq": parts["seq"],
             "struct": parts["struct"],
+            "fape": parts["fape"],
             "acc": masked_accuracy(logits.detach(), b["seq"], v["noise_mask"]),
             "grad_norm": grad_norm,
             "t": v["t"],
@@ -215,7 +253,7 @@ class Trainer:
         m = {k: float(np.nanmean([r[k] for r in rows])) for k in SCALARS}
         print(
             f"step {self.step:6d} | total {m['total']:.4f} | seq {m['seq']:.4f} acc {m['acc']:.2f} "
-            f"| struct {m['struct']:.4f} | |g| {m['grad_norm']:.2f}"
+            f"| struct {m['struct']:.4f} | fape {m['fape']:.4f} | |g| {m['grad_norm']:.2f}"
         )
         if self.args.use_wandb:
             for r in rows:

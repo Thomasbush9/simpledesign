@@ -6,7 +6,13 @@ esm_ck: checkpoints/esm2_t6_8M_UR50D
 sigma: 1.0
 
 # data
-data_dir: /Users/thomasbush/Downloads/data_test_simpledesign
+data_dir: data/afdb_100
+afdb_tar: /n/netscratch/kempner_bsabatini_lab/Lab/tbush/data/afdb_swissprot/swissprot_pdb_v6.tar       # set to the SwissProt tar path to sample; not yet recorded in ../info.md
+afdb_log: null       # existing JSON: replay; new path: save (default: data_dir/selection.json)
+afdb_n: 100
+afdb_min_plddt: 80.0
+afdb_seed: 0         # independent of the training seed; existing log takes precedence
+# Both afdb_tar and afdb_log null: load an already prepared data_dir.
 max_len: 256
 batch_size: 4       # proteins per GPU
 n_replicas: 4       # views per protein -> model batch 16
@@ -14,7 +20,7 @@ num_workers: 0
 cache: true
 
 # optimization
-num_steps: 20000
+num_steps: 50000
 lr: 1.0e-4
 weight_decay: 0.01
 grad_clip: 1.0
@@ -25,7 +31,7 @@ fixed_corruption: false
 translation_std: 0.0  # Angstrom
 
 # internal joint-sampling evaluation (same model, not independent validation)
-joint_eval_every: 5000  # null: off; also runs at the final step
+joint_eval_every: null  # null: off; also runs at the final step
 joint_eval_length: 89
 joint_eval_n_samples: 2
 joint_eval_n_steps: 200  # per sampler: joint, inverse folding, folding

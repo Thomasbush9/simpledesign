@@ -176,37 +176,3 @@ def aligned_velocity_target(x_clean, eps, coords_t, v_pred, t_prime, struct_mask
         x1_aligned = structure_rigid_alignment(x_clean.float(), x1_hat, struct_mask)
     m = struct_mask[..., None].to(x1_aligned.dtype)
     return (x1_aligned - eps.float()) * m
-
-
-def make_frames(
-    pos_N: torch.Tensor,
-    pos_Ca: torch.Tensor,
-    pos_C: torch.Tensor,
-):
-    """
-    Constructs right-handed local coordinate frames from backbone atoms.
-    Inputs are tensors of shape [N, 3]
-    """
-
-    v1 = pos_N - pos_Ca  # vector from Ca to N
-    v2 = pos_C - pos_Ca  # vector from Ca to C
-
-    # normalize v1
-    e1 = v1 / torch.norm(v1, dim=-1, keepdim=True)
-
-    # create orthogonal base from e1 to v2
-    c = torch.cross(e1, v2, dim=-1)
-    # make it orthonormal
-    e2 = c / torch.norm(c, dim=-1, keepdim=True)
-
-    # to get the third: cross between two orthonormal -> orthonormal
-    e3 = torch.cross(
-        e1,
-        e2,
-        dim=-1,
-    )
-
-    # form N , 3, 3
-    R = torch.stack([e1, e2, e3], dim=-1)
-    x = pos_Ca  # translation vector
-    return R, x
